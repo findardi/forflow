@@ -18,6 +18,13 @@ const shutdownTimeout = 10 * time.Second
 // RunAPI serves the HTTP API until ctx is cancelled, then drains
 // in-flight requests for at most shutdownTimeout.
 func RunAPI(ctx context.Context, cfg config.Config, log *slog.Logger) error {
+	pool, err := NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	// Deferred, so the pool closes only after Shutdown has drained requests.
+	defer pool.Close()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpapi.NewRouter(),
@@ -53,6 +60,12 @@ func RunAPI(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 
 // RunWorker runs the delivery worker until ctx is cancelled.
 func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
+	pool, err := NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
 	log.Info("worker started")
 	<-ctx.Done()
 	log.Info("worker stopped")

@@ -6,7 +6,6 @@ import (
 	"os"
 )
 
-// Config is shared by the api and worker processes.
 type Config struct {
 	HTTPAddr    string
 	DatabaseURL string
@@ -16,14 +15,18 @@ type Config struct {
 // so a misconfigured process never starts half-working.
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:    os.Getenv("HTTP_ADDR"),
+		HTTPAddr:    getEnv("HTTP_ADDR", ":8080"),
 		DatabaseURL: os.Getenv("DATABASE_URL"),
-	}
-	if cfg.HTTPAddr == "" {
-		cfg.HTTPAddr = ":8080"
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("config: DATABASE_URL is required")
 	}
 	return cfg, nil
+}
+
+func getEnv(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return fallback
 }
