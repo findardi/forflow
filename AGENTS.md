@@ -83,7 +83,7 @@ feature, look at how these do it before proposing anything.
 | # | Reference | Why it is useful | Where to look |
 |---|---|---|---|
 | 1 | Svix | Authors of the Standard Webhooks spec; reference for signing, headers, retry schedule, endpoint secrets and rotation | `github.com/svix/svix-webhooks`, `docs.svix.com`, `github.com/standard-webhooks/standard-webhooks` |
-| 2 | Convoy | Open-source webhook gateway written in Go; closest to our stack for workers, retries, endpoint health, rate limiting | `github.com/frain-dev/convoy`, `docs.getconvoy.io` |
+| 2 | Convoy | Open-source webhook gateway written in Go; closest to our stack for workers, retries, endpoint health, rate limiting | `github.com/frain-dev/convoy`, `getconvoy.io/docs` |
 | 3 | Hook0 | Open-source webhook server on PostgreSQL; reference for schema design, event types, subscriptions | `github.com/hook0/hook0`, `documentation.hook0.com` |
 | 4 | Hookdeck Outpost | Open-source outbound webhook service written in Go; reference for tenant model, destinations, delivery logs | `github.com/hookdeck/outpost`, `hookdeck.com/docs` |
 | 5 | Stripe webhooks | Mature producer; reference for consumer-facing behavior: retry window, endpoint auto-disable, event ordering, replay, signature verification UX | `docs.stripe.com/webhooks` |
