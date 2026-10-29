@@ -11,6 +11,8 @@ import (
 
 	"forflow/internal/config"
 	"forflow/internal/httpapi"
+	"forflow/internal/message"
+	"forflow/internal/store/sqlc"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -27,7 +29,7 @@ func RunAPI(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(),
+		Handler:           httpapi.NewRouter(sqlc.New(pool), message.NewService(pool), log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
