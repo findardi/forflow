@@ -6,6 +6,7 @@ import (
 	"os"
 )
 
+// Config is shared by the api and worker processes.
 type Config struct {
 	HTTPAddr    string
 	DatabaseURL string
