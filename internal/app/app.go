@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"forflow/internal/config"
+	"forflow/internal/delivery"
 	"forflow/internal/httpapi"
 	"forflow/internal/message"
 	"forflow/internal/store/sqlc"
@@ -68,8 +69,18 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	// ponytail: hardcoded v0 values; move to config when they need tuning per deploy.
+	// Lease must exceed HTTPTimeout, or slow but healthy attempts get delivered twice.
+	w := delivery.New(pool, delivery.Config{
+		HTTPTimeout:  30 * time.Second,
+		Lease:        60 * time.Second,
+		PollInterval: time.Second,
+	})
+
 	log.Info("worker started")
-	<-ctx.Done()
+	if err := w.Run(ctx); err != nil {
+		return fmt.Errorf("run worker: %w", err)
+	}
 	log.Info("worker stopped")
 	return nil
 }

@@ -28,7 +28,7 @@ func (q *Queries) CreateDeliveriesForMessage(ctx context.Context, messageID pgty
 }
 
 const getDeliveriesByMessageID = `-- name: GetDeliveriesByMessageID :many
-select id, message_id, endpoint_id, status, response_status, attempted_at, created_at from deliveries where message_id = $1
+select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until from deliveries where message_id = $1
 `
 
 func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype.UUID) ([]Delivery, error) {
@@ -48,6 +48,7 @@ func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype
 			&i.ResponseStatus,
 			&i.AttemptedAt,
 			&i.CreatedAt,
+			&i.LockedUntil,
 		); err != nil {
 			return nil, err
 		}
@@ -60,7 +61,7 @@ func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype
 }
 
 const getDeliveryByID = `-- name: GetDeliveryByID :one
-select id, message_id, endpoint_id, status, response_status, attempted_at, created_at from deliveries where id = $1
+select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until from deliveries where id = $1
 `
 
 func (q *Queries) GetDeliveryByID(ctx context.Context, id pgtype.UUID) (Delivery, error) {
@@ -74,6 +75,27 @@ func (q *Queries) GetDeliveryByID(ctx context.Context, id pgtype.UUID) (Delivery
 		&i.ResponseStatus,
 		&i.AttemptedAt,
 		&i.CreatedAt,
+		&i.LockedUntil,
 	)
 	return i, err
+}
+
+const recordDelivery = `-- name: RecordDelivery :exec
+update deliveries set
+status = $1,
+response_status = $2,
+attempted_at = now(),
+locked_until = null
+where id = $3 and status = 'processing'
+`
+
+type RecordDeliveryParams struct {
+	Status         string
+	ResponseStatus pgtype.Int4
+	ID             pgtype.UUID
+}
+
+func (q *Queries) RecordDelivery(ctx context.Context, arg RecordDeliveryParams) error {
+	_, err := q.db.Exec(ctx, recordDelivery, arg.Status, arg.ResponseStatus, arg.ID)
+	return err
 }

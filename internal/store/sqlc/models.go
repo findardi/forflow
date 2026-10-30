@@ -16,6 +16,7 @@ type Delivery struct {
 	ResponseStatus pgtype.Int4
 	AttemptedAt    pgtype.Timestamptz
 	CreatedAt      pgtype.Timestamptz
+	LockedUntil    pgtype.Timestamptz
 }
 
 type Endpoint struct {
