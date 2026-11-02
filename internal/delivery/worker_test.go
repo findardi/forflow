@@ -131,15 +131,18 @@ func reset(t *testing.T) {
 	}
 }
 
+// testSecret is the signing key of every seeded endpoint.
+var testSecret = []byte("forflow-test-signing-secret-32b!")
+
 // seed inserts one endpoint, one message and their pending delivery.
 func seed(t *testing.T, url string, payload []byte) (deliveryID string) {
 	t.Helper()
 	err := pool.QueryRow(context.Background(), `
-		WITH e AS (INSERT INTO endpoints (url) VALUES ($1) RETURNING id),
+		WITH e AS (INSERT INTO endpoints (url, secret) VALUES ($1, $3) RETURNING id),
 		     m AS (INSERT INTO messages (payload) VALUES ($2) RETURNING id)
 		INSERT INTO deliveries (message_id, endpoint_id)
 		SELECT m.id, e.id FROM m, e
-		RETURNING id::text`, url, payload).Scan(&deliveryID)
+		RETURNING id::text`, url, payload, testSecret).Scan(&deliveryID)
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}

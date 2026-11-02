@@ -25,6 +25,7 @@ type Endpoint struct {
 	ID        pgtype.UUID
 	Url       string
 	CreatedAt pgtype.Timestamptz
+	Secret    []byte
 }
 
 type Message struct {

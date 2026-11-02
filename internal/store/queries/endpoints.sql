@@ -1,8 +1,8 @@
 -- name: CreateEndpoint :one
 insert into endpoints
-    (url)
+    (url, secret)
 values
-    ($1)
+    ($1, $2)
 returning *;
 
 -- name: GetEndpointByID :one
