@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -69,14 +70,19 @@ func run(m *testing.M) int {
 }
 
 // migrateUp runs the Up section of every migration in order. It avoids a
-// goose dependency in tests; the files are tiny and sorted by name.
+// goose dependency in tests; the files are tiny and Glob returns them sorted.
 func migrateUp(ctx context.Context) error {
-	for _, name := range []string{"00001_init.sql", "00002_delivery_lease.sql"} {
-		b, err := os.ReadFile("../../migrations/" + name)
+	names, err := filepath.Glob("../../migrations/*.sql")
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		b, err := os.ReadFile(name)
 		if err != nil {
 			return err
 		}
 		up, _, _ := strings.Cut(string(b), "-- +goose Down")
+		// goose statement markers are SQL comments, so the section runs as is.
 		if _, err := pool.Exec(ctx, up); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
@@ -144,18 +150,48 @@ type row struct {
 	Status         string
 	ResponseStatus *int32
 	Attempted      bool
+	AttemptCount   int32
+	DueIn          time.Duration // next_attempt_at - now()
 }
 
 func get(t *testing.T, id string) row {
 	t.Helper()
 	var r row
-	err := pool.QueryRow(context.Background(),
-		`SELECT status, response_status, attempted_at IS NOT NULL FROM deliveries WHERE id = $1`, id,
-	).Scan(&r.Status, &r.ResponseStatus, &r.Attempted)
+	var dueInMs float64
+	err := pool.QueryRow(context.Background(), `
+		SELECT status, response_status, attempted_at IS NOT NULL, attempt_count,
+		       extract(epoch FROM next_attempt_at - now()) * 1000
+		FROM deliveries WHERE id = $1`, id,
+	).Scan(&r.Status, &r.ResponseStatus, &r.Attempted, &r.AttemptCount, &dueInMs)
 	if err != nil {
 		t.Fatalf("get delivery %s: %v", id, err)
 	}
+	r.DueIn = time.Duration(dueInMs) * time.Millisecond
 	return r
+}
+
+// exec runs a fixture statement against the test database.
+func exec(t *testing.T, sql string, args ...any) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("exec %q: %v", sql, err)
+	}
+}
+
+// waitAttempts polls until the delivery has recorded want attempts.
+func waitAttempts(t *testing.T, id string, want int32) row {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r := get(t, id)
+		if r.AttemptCount >= want && r.Status != "processing" {
+			return r
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivery %s: %d attempts (status %q), want %d", id, r.AttemptCount, r.Status, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // waitStatus polls until the delivery reaches want or the deadline passes.
@@ -193,18 +229,6 @@ func TestDeliveryOutcome(t *testing.T) {
 			wantStatus: "sent",
 			wantCode:   ptr(204),
 		},
-		{
-			name:       "5xx marks failed",
-			handler:    func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
-			wantStatus: "failed",
-			wantCode:   ptr(500),
-		},
-		{
-			name:       "4xx marks failed",
-			handler:    func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusGone) },
-			wantStatus: "failed",
-			wantCode:   ptr(410),
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -226,38 +250,176 @@ func TestDeliveryOutcome(t *testing.T) {
 	}
 }
 
-func TestConnectionRefusedMarksFailed(t *testing.T) {
-	reset(t)
-	srv := httptest.NewServer(http.NotFoundHandler())
-	url := srv.URL
-	srv.Close() // nothing listens on this port any more
+// Invariant 1: a failed attempt is rescheduled, never dropped. Every
+// non-2xx answer and every transport failure counts as a failed attempt.
+func TestEndpointFailureSchedulesRetry(t *testing.T) {
+	tests := []struct {
+		name     string
+		handler  http.HandlerFunc // nil: connection refused
+		wantCode *int32
+	}{
+		{
+			name:     "5xx",
+			handler:  func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			wantCode: ptr(500),
+		},
+		{
+			name:     "4xx",
+			handler:  func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusGone) },
+			wantCode: ptr(410),
+		},
+		{
+			name: "3xx is not followed",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "http://example.test/elsewhere", http.StatusFound)
+			},
+			wantCode: ptr(302),
+		},
+		{
+			// HTTPTimeout is 500ms; a retry well before the 10s wait proves
+			// the client has a timeout instead of waiting forever.
+			name: "hanging endpoint times out",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				<-r.Context().Done()
+			},
+		},
+		{name: "connection refused"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reset(t)
+			handler := tt.handler
+			if handler == nil {
+				handler = http.NotFoundHandler().ServeHTTP
+			}
+			srv := httptest.NewServer(handler)
+			defer srv.Close()
+			if tt.handler == nil {
+				srv.Close() // nothing listens on this port any more
+			}
+			id := seed(t, srv.URL, []byte(`{}`))
 
-	id := seed(t, url, []byte(`{}`))
-	startWorker(t, testConfig)
-	r := waitStatus(t, id, "failed")
+			startWorker(t, testConfig)
+			r := waitAttempts(t, id, 1)
 
-	if r.ResponseStatus != nil {
-		t.Errorf("response_status = %d, want NULL (no response was received)", *r.ResponseStatus)
+			if r.Status != "pending" {
+				t.Errorf("status = %q, want pending (retry scheduled)", r.Status)
+			}
+			if r.AttemptCount != 1 {
+				t.Errorf("attempt_count = %d, want 1", r.AttemptCount)
+			}
+			// First retry waits 5s plus up to 10% jitter.
+			if r.DueIn < 3*time.Second || r.DueIn > 6*time.Second {
+				t.Errorf("next attempt due in %v, want about 5s", r.DueIn)
+			}
+			if deref(r.ResponseStatus) != deref(tt.wantCode) {
+				t.Errorf("response_status = %v, want %v", deref(r.ResponseStatus), deref(tt.wantCode))
+			}
+		})
 	}
 }
 
-func TestHangingEndpointTimesOut(t *testing.T) {
+// A due retry is claimed again and its success is recorded.
+func TestDueRetryIsDelivered(t *testing.T) {
 	reset(t)
-	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-release
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 	}))
 	defer srv.Close()
-	defer close(release)
 
 	id := seed(t, srv.URL, []byte(`{}`))
 	startWorker(t, testConfig)
+	waitAttempts(t, id, 1)
 
-	// HTTPTimeout is 500ms; failing well before the 10s wait proves the
-	// client has a timeout instead of waiting forever.
+	// Fast-forward the schedule instead of waiting 5s.
+	exec(t, `UPDATE deliveries SET next_attempt_at = now() WHERE id = $1`, id)
+	r := waitStatus(t, id, "sent")
+
+	if r.AttemptCount != 2 {
+		t.Errorf("attempt_count = %d, want 2", r.AttemptCount)
+	}
+}
+
+func TestExhaustedRetriesMarkFailed(t *testing.T) {
+	reset(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	id := seed(t, srv.URL, []byte(`{}`))
+	// Seven attempts already failed; the next one is the last.
+	exec(t, `UPDATE deliveries SET attempt_count = 7 WHERE id = $1`, id)
+
+	startWorker(t, testConfig)
 	r := waitStatus(t, id, "failed")
-	if r.ResponseStatus != nil {
-		t.Errorf("response_status = %d, want NULL on timeout", *r.ResponseStatus)
+
+	if r.AttemptCount != 8 {
+		t.Errorf("attempt_count = %d, want 8", r.AttemptCount)
+	}
+}
+
+// An unparseable endpoint URL is our failure, not the endpoint's: the row is
+// discarded without spending an attempt.
+func TestInvalidURLIsDiscarded(t *testing.T) {
+	reset(t)
+	id := seed(t, "http://bad host/", []byte(`{}`))
+
+	startWorker(t, testConfig)
+	r := waitStatus(t, id, "discarded")
+
+	if r.AttemptCount != 0 {
+		t.Errorf("attempt_count = %d, want 0", r.AttemptCount)
+	}
+}
+
+// Fencing: when the lease changes hands mid-attempt, the stale worker's
+// result is dropped and the worker keeps running.
+func TestLostLeaseDropsResult(t *testing.T) {
+	reset(t)
+	const stolen = `{"n":1}`
+	stealErr := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if string(b) != stolen {
+			return
+		}
+		// Simulate another worker reclaiming the row while this one sends.
+		_, err := pool.Exec(r.Context(), `
+			UPDATE deliveries SET lease_id = uuidv7()
+			WHERE message_id IN (SELECT id FROM messages WHERE payload = $1)`, b)
+		stealErr <- err
+	}))
+	defer srv.Close()
+
+	stolenID := seed(t, srv.URL, []byte(stolen))
+	startWorker(t, testConfig)
+
+	select {
+	case err := <-stealErr:
+		if err != nil {
+			t.Fatalf("steal lease: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker never called the endpoint")
+	}
+
+	// The worker handles one row at a time, so once the next row is sent the
+	// stale outcome has been recorded (or dropped). It also proves the worker
+	// survived the lost lease.
+	next := seed(t, srv.URL, []byte(`{"n":2}`))
+	waitStatus(t, next, "sent")
+
+	r := get(t, stolenID)
+	if r.Status != "processing" || r.Attempted || r.AttemptCount != 0 {
+		t.Errorf("stolen row = %+v, want untouched processing row", r)
 	}
 }
 
@@ -402,13 +564,13 @@ func TestShutdownFinishesInFlight(t *testing.T) {
 	}
 }
 
+// setLease makes the row look claimed by another worker whose lease ends at until.
 func setLease(t *testing.T, id, until string) {
 	t.Helper()
-	_, err := pool.Exec(context.Background(),
-		`UPDATE deliveries SET status = 'processing', locked_until = `+until+` WHERE id = $1`, id)
-	if err != nil {
-		t.Fatalf("set lease: %v", err)
-	}
+	exec(t, `UPDATE deliveries
+		SET status = 'processing', lease_id = uuidv7(),
+		    locked_until = `+until+`, next_attempt_at = `+until+`
+		WHERE id = $1`, id)
 }
 
 func ptr(v int32) *int32 { return &v }
