@@ -280,7 +280,12 @@ func TestEndpointFailureSchedulesRetry(t *testing.T) {
 			// the client has a timeout instead of waiting forever.
 			name: "hanging endpoint times out",
 			handler: func(w http.ResponseWriter, r *http.Request) {
-				<-r.Context().Done()
+				// Bounded so srv.Close does not wait on this handler forever:
+				// the server may not notice the client giving up.
+				select {
+				case <-r.Context().Done():
+				case <-time.After(2 * testConfig.HTTPTimeout):
+				}
 			},
 		},
 		{name: "connection refused"},
