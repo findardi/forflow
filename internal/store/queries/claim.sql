@@ -14,4 +14,4 @@ where d.id = (
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
-returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id;
+returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret;

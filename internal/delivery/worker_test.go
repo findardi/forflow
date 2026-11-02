@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +28,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"forflow/internal/delivery"
+	"forflow/internal/signing"
 )
 
 var pool *pgxpool.Pool
@@ -458,6 +460,112 @@ func TestSendsExactPayloadBytes(t *testing.T) {
 	}
 	if b := <-body; string(b) != string(payload) {
 		t.Errorf("body = %q, want %q", b, payload)
+	}
+}
+
+// received is what one webhook request looked like on the wire.
+type received struct {
+	header http.Header
+	body   []byte
+}
+
+// recordingServer answers each request with the next status in statuses
+// (200 once they run out) and records every request it gets.
+func recordingServer(t *testing.T, statuses ...int) (*httptest.Server, <-chan received) {
+	t.Helper()
+	reqs := make(chan received, 10)
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		reqs <- received{header: r.Header.Clone(), body: b}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(statuses) > 0 {
+			w.WriteHeader(statuses[0])
+			statuses = statuses[1:]
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, reqs
+}
+
+func messageID(t *testing.T, deliveryID string) string {
+	t.Helper()
+	var id string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT message_id::text FROM deliveries WHERE id = $1`, deliveryID).Scan(&id); err != nil {
+		t.Fatalf("message id: %v", err)
+	}
+	return id
+}
+
+// verify checks a received request the way a consumer would.
+func verify(t *testing.T, r received) {
+	t.Helper()
+	err := signing.Verify(testSecret,
+		r.header.Get("webhook-id"), r.header.Get("webhook-timestamp"), r.header.Get("webhook-signature"),
+		r.body, time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Errorf("consumer verification failed: %v", err)
+	}
+}
+
+// Invariant 4: the signature covers the exact raw body bytes that are sent.
+func TestSignatureCoversSentBody(t *testing.T) {
+	reset(t)
+	// Odd spacing and key order: any re-encoding would break the signature.
+	payload := []byte(`{"b":1,  "a":[2, 3]}`)
+	srv, reqs := recordingServer(t)
+
+	id := seed(t, srv.URL, payload)
+	startWorker(t, testConfig)
+	waitStatus(t, id, "sent")
+
+	r := <-reqs
+	if got, want := r.header.Get("webhook-id"), messageID(t, id); got != want {
+		t.Errorf("webhook-id = %q, want message id %q", got, want)
+	}
+	if string(r.body) != string(payload) {
+		t.Errorf("body = %q, want %q", r.body, payload)
+	}
+	verify(t, r)
+}
+
+// Invariant 3: webhook-id is stable across retries; webhook-timestamp (and so
+// the signature) is fresh on every attempt.
+func TestRetryKeepsIDRefreshesTimestamp(t *testing.T) {
+	reset(t)
+	srv, reqs := recordingServer(t, http.StatusServiceUnavailable)
+
+	id := seed(t, srv.URL, []byte(`{}`))
+	startWorker(t, testConfig)
+	waitAttempts(t, id, 1)
+
+	// The header has second resolution; cross a second boundary before the
+	// retry so a fresh timestamp is observable.
+	time.Sleep(1100 * time.Millisecond)
+	exec(t, `UPDATE deliveries SET next_attempt_at = now() WHERE id = $1`, id)
+	waitStatus(t, id, "sent")
+
+	first, retry := <-reqs, <-reqs
+	want := messageID(t, id)
+	for i, r := range []received{first, retry} {
+		if got := r.header.Get("webhook-id"); got != want {
+			t.Errorf("attempt %d: webhook-id = %q, want %q", i+1, got, want)
+		}
+		verify(t, r)
+	}
+
+	t1, err1 := strconv.ParseInt(first.header.Get("webhook-timestamp"), 10, 64)
+	t2, err2 := strconv.ParseInt(retry.header.Get("webhook-timestamp"), 10, 64)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("timestamps not integers: %v, %v", err1, err2)
+	}
+	if t2 <= t1 {
+		t.Errorf("retry webhook-timestamp = %d, want later than first attempt %d", t2, t1)
+	}
+	if first.header.Get("webhook-signature") == retry.header.Get("webhook-signature") {
+		t.Error("retry reused the first attempt's signature")
 	}
 }
 

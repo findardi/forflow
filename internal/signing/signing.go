@@ -65,7 +65,7 @@ func DecodeSecret(s string) ([]byte, error) {
 // Sign returns the webhook-signature value for one attempt. Call it per
 // attempt: ts changes on every retry, msgID never does.
 func Sign(secret []byte, msgID string, ts time.Time, body []byte) string {
-	tsStr := strconv.FormatInt(ts.Unix(), 10)
+	tsStr := FormatTimestamp(ts)
 
 	mac := writeHMAC(msgID, tsStr, secret, body)
 
@@ -115,4 +115,10 @@ func writeHMAC(msgID, tsStr string, secret, body []byte) []byte {
 	mac.Write(body)
 
 	return mac.Sum(nil)
+}
+
+// FormatTimestamp renders ts as the webhook-timestamp header value. Sign uses
+// it too, so the header and the signed content cannot drift apart.
+func FormatTimestamp(ts time.Time) string {
+	return strconv.FormatInt(ts.Unix(), 10)
 }

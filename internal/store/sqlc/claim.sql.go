@@ -27,7 +27,7 @@ where d.id = (
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
-returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id
+returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret
 `
 
 type ClaimDeliveryRow struct {
@@ -37,6 +37,7 @@ type ClaimDeliveryRow struct {
 	LeaseID      pgtype.UUID
 	AttemptCount int32
 	MessageID    pgtype.UUID
+	Secret       []byte
 }
 
 func (q *Queries) ClaimDelivery(ctx context.Context, lease pgtype.Interval) (ClaimDeliveryRow, error) {
@@ -49,6 +50,7 @@ func (q *Queries) ClaimDelivery(ctx context.Context, lease pgtype.Interval) (Cla
 		&i.LeaseID,
 		&i.AttemptCount,
 		&i.MessageID,
+		&i.Secret,
 	)
 	return i, err
 }

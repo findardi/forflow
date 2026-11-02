@@ -212,3 +212,16 @@ func TestGenerateSecret(t *testing.T) {
 		t.Error("EncodeSecret/DecodeSecret round trip changed the secret")
 	}
 }
+
+func TestFormatTimestamp(t *testing.T) {
+	ts := time.Unix(vectorTimestamp, 999_999_999)
+	want := strconv.Itoa(vectorTimestamp)
+
+	if got := signing.FormatTimestamp(ts); got != want {
+		t.Errorf("FormatTimestamp() = %q, want %q (whole seconds, truncated)", got, want)
+	}
+	// The header is an instant, so the location must not change it.
+	if got := signing.FormatTimestamp(ts.In(time.FixedZone("UTC+7", 7*3600))); got != want {
+		t.Errorf("FormatTimestamp(non-UTC) = %q, want %q", got, want)
+	}
+}
