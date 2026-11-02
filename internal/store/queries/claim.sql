@@ -1,7 +1,6 @@
 -- name: ClaimDelivery :one
 update deliveries d
 set status = 'processing', 
-    locked_until = now() + sqlc.arg(lease)::interval, 
     lease_id = uuidv7(), 
     next_attempt_at = now() + sqlc.arg(lease)::interval
 from messages m, endpoints e
