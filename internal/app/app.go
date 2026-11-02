@@ -75,6 +75,7 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		HTTPTimeout:  30 * time.Second,
 		Lease:        60 * time.Second,
 		PollInterval: time.Second,
+		Logger:       log,
 	})
 
 	log.Info("worker started")

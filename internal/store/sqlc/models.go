@@ -17,6 +17,9 @@ type Delivery struct {
 	AttemptedAt    pgtype.Timestamptz
 	CreatedAt      pgtype.Timestamptz
 	LockedUntil    pgtype.Timestamptz
+	AttemptCount   int32
+	NextAttemptAt  pgtype.Timestamptz
+	LeaseID        pgtype.UUID
 }
 
 type Endpoint struct {

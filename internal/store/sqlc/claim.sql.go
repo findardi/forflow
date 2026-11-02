@@ -13,29 +13,43 @@ import (
 
 const claimDelivery = `-- name: ClaimDelivery :one
 update deliveries d
-set status = 'processing', locked_until = now() + $1::interval
+set status = 'processing', 
+    locked_until = now() + $1::interval, 
+    lease_id = uuidv7(), 
+    next_attempt_at = now() + $1::interval
 from messages m, endpoints e
 where d.id = (
     select id from deliveries
-    where status = 'pending' or (status = 'processing' and locked_until < now())
-    order by id asc
+    where status in ('pending', 'processing')
+    and next_attempt_at <= now()
+    order by next_attempt_at asc
     limit 1
     for update skip locked
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
-returning d.id, e.url as endpoint, m.payload
+returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id
 `
 
 type ClaimDeliveryRow struct {
-	ID       pgtype.UUID
-	Endpoint string
-	Payload  []byte
+	ID           pgtype.UUID
+	Endpoint     string
+	Payload      []byte
+	LeaseID      pgtype.UUID
+	AttemptCount int32
+	MessageID    pgtype.UUID
 }
 
 func (q *Queries) ClaimDelivery(ctx context.Context, lease pgtype.Interval) (ClaimDeliveryRow, error) {
 	row := q.db.QueryRow(ctx, claimDelivery, lease)
 	var i ClaimDeliveryRow
-	err := row.Scan(&i.ID, &i.Endpoint, &i.Payload)
+	err := row.Scan(
+		&i.ID,
+		&i.Endpoint,
+		&i.Payload,
+		&i.LeaseID,
+		&i.AttemptCount,
+		&i.MessageID,
+	)
 	return i, err
 }

@@ -28,7 +28,7 @@ func (q *Queries) CreateDeliveriesForMessage(ctx context.Context, messageID pgty
 }
 
 const getDeliveriesByMessageID = `-- name: GetDeliveriesByMessageID :many
-select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until from deliveries where message_id = $1
+select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until, attempt_count, next_attempt_at, lease_id from deliveries where message_id = $1
 `
 
 func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype.UUID) ([]Delivery, error) {
@@ -49,6 +49,9 @@ func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype
 			&i.AttemptedAt,
 			&i.CreatedAt,
 			&i.LockedUntil,
+			&i.AttemptCount,
+			&i.NextAttemptAt,
+			&i.LeaseID,
 		); err != nil {
 			return nil, err
 		}
@@ -61,7 +64,7 @@ func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype
 }
 
 const getDeliveryByID = `-- name: GetDeliveryByID :one
-select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until from deliveries where id = $1
+select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until, attempt_count, next_attempt_at, lease_id from deliveries where id = $1
 `
 
 func (q *Queries) GetDeliveryByID(ctx context.Context, id pgtype.UUID) (Delivery, error) {
@@ -76,26 +79,146 @@ func (q *Queries) GetDeliveryByID(ctx context.Context, id pgtype.UUID) (Delivery
 		&i.AttemptedAt,
 		&i.CreatedAt,
 		&i.LockedUntil,
+		&i.AttemptCount,
+		&i.NextAttemptAt,
+		&i.LeaseID,
 	)
 	return i, err
 }
 
-const recordDelivery = `-- name: RecordDelivery :exec
-update deliveries set
-status = $1,
-response_status = $2,
-attempted_at = now(),
-locked_until = null
-where id = $3 and status = 'processing'
+const markDiscarded = `-- name: MarkDiscarded :execrows
+update deliveries
+set
+    status = 'discarded',
+    locked_until = null,
+    lease_id = null
+where id = $1 and status = 'processing' and lease_id = $2
 `
 
-type RecordDeliveryParams struct {
-	Status         string
-	ResponseStatus pgtype.Int4
-	ID             pgtype.UUID
+type MarkDiscardedParams struct {
+	ID      pgtype.UUID
+	LeaseID pgtype.UUID
 }
 
-func (q *Queries) RecordDelivery(ctx context.Context, arg RecordDeliveryParams) error {
-	_, err := q.db.Exec(ctx, recordDelivery, arg.Status, arg.ResponseStatus, arg.ID)
-	return err
+// MarkDiscarded is for permanent errors on our side: the endpoint was never
+// contacted, so the attempt budget is left untouched.
+func (q *Queries) MarkDiscarded(ctx context.Context, arg MarkDiscardedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markDiscarded, arg.ID, arg.LeaseID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markFailed = `-- name: MarkFailed :execrows
+update deliveries
+set
+    status = 'failed',
+    response_status = $3,
+    attempted_at = now(),
+    attempt_count = attempt_count + 1,
+    locked_until = null,
+    lease_id = null
+where id = $1 and status = 'processing' and lease_id = $2
+`
+
+type MarkFailedParams struct {
+	ID             pgtype.UUID
+	LeaseID        pgtype.UUID
+	ResponseStatus pgtype.Int4
+}
+
+func (q *Queries) MarkFailed(ctx context.Context, arg MarkFailedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markFailed, arg.ID, arg.LeaseID, arg.ResponseStatus)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markSent = `-- name: MarkSent :execrows
+
+update deliveries
+set
+    status = 'sent',
+    response_status = $3,
+    attempted_at = now(),
+    attempt_count = attempt_count + 1,
+    locked_until = null,
+    lease_id = null
+where id = $1 and status = 'processing' and lease_id = $2
+`
+
+type MarkSentParams struct {
+	ID             pgtype.UUID
+	LeaseID        pgtype.UUID
+	ResponseStatus pgtype.Int4
+}
+
+// Outcome queries below are fenced by lease_id: zero affected rows means the
+// lease was lost to another worker and the caller's result must be dropped.
+func (q *Queries) MarkSent(ctx context.Context, arg MarkSentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markSent, arg.ID, arg.LeaseID, arg.ResponseStatus)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseLease = `-- name: ReleaseLease :execrows
+update deliveries
+set
+    status = 'pending',
+    next_attempt_at = now(),
+    locked_until = null,
+    lease_id = null
+where id = $1 and status = 'processing' and lease_id = $2
+`
+
+type ReleaseLeaseParams struct {
+	ID      pgtype.UUID
+	LeaseID pgtype.UUID
+}
+
+// ReleaseLease hands a claimed delivery back without spending an attempt, e.g.
+// when the worker shuts down before sending.
+func (q *Queries) ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseLease, arg.ID, arg.LeaseID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const scheduleRetry = `-- name: ScheduleRetry :execrows
+update deliveries
+set
+    status = 'pending',
+    response_status = $3,
+    attempted_at = now(),
+    attempt_count = attempt_count + 1,
+    next_attempt_at = $4,
+    locked_until = null,
+    lease_id = null
+where id = $1 and status = 'processing' and lease_id = $2
+`
+
+type ScheduleRetryParams struct {
+	ID             pgtype.UUID
+	LeaseID        pgtype.UUID
+	ResponseStatus pgtype.Int4
+	NextAttemptAt  pgtype.Timestamptz
+}
+
+func (q *Queries) ScheduleRetry(ctx context.Context, arg ScheduleRetryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, scheduleRetry,
+		arg.ID,
+		arg.LeaseID,
+		arg.ResponseStatus,
+		arg.NextAttemptAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
