@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"forflow/internal/signing"
 	"forflow/internal/store/sqlc"
 )
 
@@ -151,7 +152,16 @@ func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult
 	if err != nil {
 		return sendResult{outcome: outcomeDiscarded, errorKind: "invalid_request"}
 	}
+
+	// One ts for both headers: the signed timestamp must equal the sent one.
+	// Signing here, per attempt, keeps msgID stable and ts fresh on retries.
+	ts := w.now()
+	msgID := pgtype.UUID.String(job.MessageID)
+
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("webhook-id", msgID)
+	req.Header.Set("webhook-timestamp", signing.FormatTimestamp(ts))
+	req.Header.Set("webhook-signature", signing.Sign(job.Secret, msgID, ts, job.Payload))
 
 	start := w.now()
 	resp, err := w.httpClient.Do(req)

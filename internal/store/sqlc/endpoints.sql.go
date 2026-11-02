@@ -13,26 +13,41 @@ import (
 
 const createEndpoint = `-- name: CreateEndpoint :one
 insert into endpoints
-    (url)
+    (url, secret)
 values
-    ($1)
-returning id, url, created_at
+    ($1, $2)
+returning id, url, created_at, secret
 `
 
-func (q *Queries) CreateEndpoint(ctx context.Context, url string) (Endpoint, error) {
-	row := q.db.QueryRow(ctx, createEndpoint, url)
+type CreateEndpointParams struct {
+	Url    string
+	Secret []byte
+}
+
+func (q *Queries) CreateEndpoint(ctx context.Context, arg CreateEndpointParams) (Endpoint, error) {
+	row := q.db.QueryRow(ctx, createEndpoint, arg.Url, arg.Secret)
 	var i Endpoint
-	err := row.Scan(&i.ID, &i.Url, &i.CreatedAt)
+	err := row.Scan(
+		&i.ID,
+		&i.Url,
+		&i.CreatedAt,
+		&i.Secret,
+	)
 	return i, err
 }
 
 const getEndpointByID = `-- name: GetEndpointByID :one
-select id, url, created_at from endpoints where id = $1
+select id, url, created_at, secret from endpoints where id = $1
 `
 
 func (q *Queries) GetEndpointByID(ctx context.Context, id pgtype.UUID) (Endpoint, error) {
 	row := q.db.QueryRow(ctx, getEndpointByID, id)
 	var i Endpoint
-	err := row.Scan(&i.ID, &i.Url, &i.CreatedAt)
+	err := row.Scan(
+		&i.ID,
+		&i.Url,
+		&i.CreatedAt,
+		&i.Secret,
+	)
 	return i, err
 }

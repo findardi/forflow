@@ -9,6 +9,7 @@ import (
 	"net/url"
 
 	"forflow/internal/message"
+	"forflow/internal/signing"
 	"forflow/internal/store/sqlc"
 )
 
@@ -53,16 +54,21 @@ func (a *api) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ep, err := a.queries.CreateEndpoint(r.Context(), req.URL)
+	ep, err := a.queries.CreateEndpoint(r.Context(), sqlc.CreateEndpointParams{
+		Url:    req.URL,
+		Secret: signing.GenerateSecret(),
+	})
 	if err != nil {
 		a.log.ErrorContext(r.Context(), "create endpoint", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
+	// The secret is shown only here; later reads never expose it.
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":         ep.ID,
 		"url":        ep.Url,
+		"secret":     signing.EncodeSecret(ep.Secret),
 		"created_at": ep.CreatedAt,
 	})
 }

@@ -16,7 +16,6 @@ type Delivery struct {
 	ResponseStatus pgtype.Int4
 	AttemptedAt    pgtype.Timestamptz
 	CreatedAt      pgtype.Timestamptz
-	LockedUntil    pgtype.Timestamptz
 	AttemptCount   int32
 	NextAttemptAt  pgtype.Timestamptz
 	LeaseID        pgtype.UUID
@@ -26,6 +25,7 @@ type Endpoint struct {
 	ID        pgtype.UUID
 	Url       string
 	CreatedAt pgtype.Timestamptz
+	Secret    []byte
 }
 
 type Message struct {

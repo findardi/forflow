@@ -28,7 +28,7 @@ func (q *Queries) CreateDeliveriesForMessage(ctx context.Context, messageID pgty
 }
 
 const getDeliveriesByMessageID = `-- name: GetDeliveriesByMessageID :many
-select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until, attempt_count, next_attempt_at, lease_id from deliveries where message_id = $1
+select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, attempt_count, next_attempt_at, lease_id from deliveries where message_id = $1
 `
 
 func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype.UUID) ([]Delivery, error) {
@@ -48,7 +48,6 @@ func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype
 			&i.ResponseStatus,
 			&i.AttemptedAt,
 			&i.CreatedAt,
-			&i.LockedUntil,
 			&i.AttemptCount,
 			&i.NextAttemptAt,
 			&i.LeaseID,
@@ -64,7 +63,7 @@ func (q *Queries) GetDeliveriesByMessageID(ctx context.Context, messageID pgtype
 }
 
 const getDeliveryByID = `-- name: GetDeliveryByID :one
-select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, locked_until, attempt_count, next_attempt_at, lease_id from deliveries where id = $1
+select id, message_id, endpoint_id, status, response_status, attempted_at, created_at, attempt_count, next_attempt_at, lease_id from deliveries where id = $1
 `
 
 func (q *Queries) GetDeliveryByID(ctx context.Context, id pgtype.UUID) (Delivery, error) {
@@ -78,7 +77,6 @@ func (q *Queries) GetDeliveryByID(ctx context.Context, id pgtype.UUID) (Delivery
 		&i.ResponseStatus,
 		&i.AttemptedAt,
 		&i.CreatedAt,
-		&i.LockedUntil,
 		&i.AttemptCount,
 		&i.NextAttemptAt,
 		&i.LeaseID,
@@ -90,7 +88,6 @@ const markDiscarded = `-- name: MarkDiscarded :execrows
 update deliveries
 set
     status = 'discarded',
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2
 `
@@ -117,7 +114,6 @@ set
     response_status = $3,
     attempted_at = now(),
     attempt_count = attempt_count + 1,
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2
 `
@@ -144,7 +140,6 @@ set
     response_status = $3,
     attempted_at = now(),
     attempt_count = attempt_count + 1,
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2
 `
@@ -170,7 +165,6 @@ update deliveries
 set
     status = 'pending',
     next_attempt_at = now(),
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2
 `
@@ -198,7 +192,6 @@ set
     attempted_at = now(),
     attempt_count = attempt_count + 1,
     next_attempt_at = $4,
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2
 `

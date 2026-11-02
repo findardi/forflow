@@ -201,6 +201,9 @@ docs/ai-workflow.md      how the owner works with AI (the only file in docs/)
   bulk `DELETE` for retention.
 - A new query on a hot path ships with its supporting index and a short
   `EXPLAIN` note in the change summary.
+- During development, a schema change ignores existing rows: no backfill, and
+  no options or questions about old data. A new required column is added as
+  required. The development database holds no real data and can be reset.
 
 ## Delivery invariants (tests must protect these)
 

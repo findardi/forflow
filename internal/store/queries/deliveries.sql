@@ -21,7 +21,6 @@ set
     response_status = $3,
     attempted_at = now(),
     attempt_count = attempt_count + 1,
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2;
 
@@ -33,7 +32,6 @@ set
     attempted_at = now(),
     attempt_count = attempt_count + 1,
     next_attempt_at = $4,
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2;
 
@@ -44,7 +42,6 @@ set
     response_status = $3,
     attempted_at = now(),
     attempt_count = attempt_count + 1,
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2;
 
@@ -54,7 +51,6 @@ where id = $1 and status = 'processing' and lease_id = $2;
 update deliveries
 set
     status = 'discarded',
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2;
 
@@ -65,6 +61,5 @@ update deliveries
 set
     status = 'pending',
     next_attempt_at = now(),
-    locked_until = null,
     lease_id = null
 where id = $1 and status = 'processing' and lease_id = $2;
