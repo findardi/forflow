@@ -14,7 +14,6 @@ import (
 const claimDelivery = `-- name: ClaimDelivery :one
 update deliveries d
 set status = 'processing', 
-    locked_until = now() + $1::interval, 
     lease_id = uuidv7(), 
     next_attempt_at = now() + $1::interval
 from messages m, endpoints e

@@ -574,7 +574,7 @@ func setLease(t *testing.T, id, until string) {
 	t.Helper()
 	exec(t, `UPDATE deliveries
 		SET status = 'processing', lease_id = uuidv7(),
-		    locked_until = `+until+`, next_attempt_at = `+until+`
+		    next_attempt_at = `+until+`
 		WHERE id = $1`, id)
 }
 

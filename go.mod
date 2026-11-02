@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.44.0
 )
