@@ -41,6 +41,7 @@ const maxDrainBytes = 64 << 10
 
 // Worker claims due deliveries and sends them to customer endpoints.
 type Worker struct {
+	pool       *pgxpool.Pool // claim runs in its own transaction
 	q          *sqlc.Queries
 	cfg        Config
 	lease      pgtype.Interval
@@ -69,8 +70,9 @@ func New(pool *pgxpool.Pool, cfg Config) *Worker {
 		log = slog.Default()
 	}
 	return &Worker{
-		q:   sqlc.New(pool),
-		cfg: cfg,
+		pool: pool,
+		q:    sqlc.New(pool),
+		cfg:  cfg,
 		lease: pgtype.Interval{
 			Microseconds: cfg.Lease.Microseconds(),
 			Valid:        true,
@@ -134,19 +136,44 @@ func (w *Worker) loop(ctx context.Context) error {
 	}
 }
 
+// claim locks an endpoint, then claims its oldest due delivery in a second
+// statement, so the per-endpoint cap is checked against a snapshot taken after
+// the lock (see claim.sql). The transaction lasts milliseconds; the HTTP call
+// happens after commit.
 func (w *Worker) claim(ctx context.Context) (sqlc.ClaimDeliveryRow, bool, error) {
-	job, err := w.q.ClaimDelivery(ctx, sqlc.ClaimDeliveryParams{
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return sqlc.ClaimDeliveryRow{}, false, fmt.Errorf("begin claim: %w", err)
+	}
+	// No-op after Commit. On an early return it releases the endpoint lock,
+	// even when ctx is already cancelled.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	q := w.q.WithTx(tx)
+
+	endpointID, err := q.LockClaimableEndpoint(ctx, w.cfg.MaxInFlight)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return sqlc.ClaimDeliveryRow{}, false, nil
+	}
+	if err != nil {
+		return sqlc.ClaimDeliveryRow{}, false, fmt.Errorf("lock claimable endpoint: %w", err)
+	}
+
+	job, err := q.ClaimDelivery(ctx, sqlc.ClaimDeliveryParams{
 		Lease:       w.lease,
+		EndpointID:  endpointID,
 		MaxInFlight: w.cfg.MaxInFlight,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return job, false, nil
+		// The fresh count found the endpoint at its cap; the coarse filter was stale.
+		return sqlc.ClaimDeliveryRow{}, false, nil
 	}
-
 	if err != nil {
-		return sqlc.ClaimDeliveryRow{}, false, fmt.Errorf("get claim delivery: %w", err)
+		return sqlc.ClaimDeliveryRow{}, false, fmt.Errorf("claim delivery: %w", err)
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		return sqlc.ClaimDeliveryRow{}, false, fmt.Errorf("commit claim: %w", err)
+	}
 	return job, true, nil
 }
 

@@ -20,18 +20,18 @@ from messages m, endpoints e
 where d.id = (
     select c.id
     from deliveries c
-    join endpoints ce on ce.id = c.endpoint_id
-    where c.status in ('pending', 'processing')
+    where c.endpoint_id = $2::uuid
+    and c.status in ('pending', 'processing')
     and c.next_attempt_at <= now()
     and (
         select count(*) from deliveries f
-        where f.endpoint_id = ce.id
+        where f.endpoint_id = $2::uuid
         and f.status = 'processing'
         and f.next_attempt_at > now()
-    ) < $2::int
+    ) < $3::int
     order by c.next_attempt_at asc
     limit 1
-    for update of c, ce skip locked
+    for update skip locked
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
@@ -40,6 +40,7 @@ returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.mes
 
 type ClaimDeliveryParams struct {
 	Lease       pgtype.Interval
+	EndpointID  pgtype.UUID
 	MaxInFlight int32
 }
 
@@ -53,8 +54,10 @@ type ClaimDeliveryRow struct {
 	Secret       []byte
 }
 
+// Must run in the transaction that holds the endpoint lock from
+// LockClaimableEndpoint. Returns no row when the endpoint is already at its cap.
 func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (ClaimDeliveryRow, error) {
-	row := q.db.QueryRow(ctx, claimDelivery, arg.Lease, arg.MaxInFlight)
+	row := q.db.QueryRow(ctx, claimDelivery, arg.Lease, arg.EndpointID, arg.MaxInFlight)
 	var i ClaimDeliveryRow
 	err := row.Scan(
 		&i.ID,
@@ -66,4 +69,37 @@ func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (C
 		&i.Secret,
 	)
 	return i, err
+}
+
+const lockClaimableEndpoint = `-- name: LockClaimableEndpoint :one
+
+select c.endpoint_id
+from deliveries c
+join endpoints ce on ce.id = c.endpoint_id
+where c.status in ('pending', 'processing')
+and c.next_attempt_at <= now()
+and (
+    select count(*) from deliveries f
+    where f.endpoint_id = ce.id
+    and f.status = 'processing'
+    and f.next_attempt_at > now()
+) < $1::int
+order by c.next_attempt_at asc
+limit 1
+for update of ce skip locked
+`
+
+// Claiming is two statements in one transaction. Under READ COMMITTED each
+// statement takes a fresh snapshot, so counting in a second statement, after
+// the endpoint lock is held, sees every claim committed by the lock's previous
+// holder. Counting in the same statement that takes the lock can read a
+// snapshot from before that commit and overshoot the cap.
+// Picks the endpoint owning the oldest due delivery and locks its row until the
+// transaction ends. The in-flight count here is only a coarse filter; it may be
+// stale, and ClaimDelivery counts again.
+func (q *Queries) LockClaimableEndpoint(ctx context.Context, maxInFlight int32) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockClaimableEndpoint, maxInFlight)
+	var endpoint_id pgtype.UUID
+	err := row.Scan(&endpoint_id)
+	return endpoint_id, err
 }
