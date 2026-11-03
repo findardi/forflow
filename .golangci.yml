@@ -1,0 +1,6 @@
+version: "2"
+
+run:
+  # Integration tests sit behind a build tag; lint them too.
+  build-tags:
+    - integration

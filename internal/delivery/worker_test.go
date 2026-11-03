@@ -96,6 +96,8 @@ var testConfig = delivery.Config{
 	HTTPTimeout:  500 * time.Millisecond,
 	Lease:        5 * time.Second,
 	PollInterval: 50 * time.Millisecond,
+	Workers:      1,
+	MaxInFlight:  1,
 }
 
 // startWorker runs w until the test ends and returns a stop func that
@@ -696,4 +698,143 @@ func deref(p *int32) any {
 		return "NULL"
 	}
 	return *p
+}
+
+// seedEndpoint inserts one endpoint, for tests that send several deliveries to it.
+func seedEndpoint(t *testing.T, url string) (endpointID string) {
+	t.Helper()
+	err := pool.QueryRow(context.Background(),
+		`INSERT INTO endpoints (url, secret) VALUES ($1, $2) RETURNING id::text`,
+		url, testSecret).Scan(&endpointID)
+	if err != nil {
+		t.Fatalf("seed endpoint: %v", err)
+	}
+	return endpointID
+}
+
+// seedDelivery inserts one message and its pending delivery to endpointID.
+func seedDelivery(t *testing.T, endpointID string, payload []byte) (deliveryID string) {
+	t.Helper()
+	err := pool.QueryRow(context.Background(), `
+		WITH m AS (INSERT INTO messages (payload) VALUES ($2) RETURNING id)
+		INSERT INTO deliveries (message_id, endpoint_id)
+		SELECT m.id, $1 FROM m
+		RETURNING id::text`, endpointID, payload).Scan(&deliveryID)
+	if err != nil {
+		t.Fatalf("seed delivery: %v", err)
+	}
+	return deliveryID
+}
+
+// hangingEndpoint is a customer endpoint that accepts connections but never
+// replies until released, and records how many requests it held at once.
+type hangingEndpoint struct {
+	srv     *httptest.Server
+	release chan struct{}
+
+	mu      sync.Mutex
+	current int
+	peak    int
+}
+
+// newHangingEndpoint starts the endpoint with n due deliveries that are older
+// than anything else, so a first-come claim order would pick all of them first.
+func newHangingEndpoint(t *testing.T, n int) *hangingEndpoint {
+	t.Helper()
+	h := &hangingEndpoint{release: make(chan struct{})}
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		h.current++
+		h.peak = max(h.peak, h.current)
+		h.mu.Unlock()
+		defer func() {
+			h.mu.Lock()
+			h.current--
+			h.mu.Unlock()
+		}()
+		select {
+		case <-h.release:
+		case <-r.Context().Done():
+		}
+	}))
+	// Registered first, so it runs after the worker has stopped.
+	t.Cleanup(h.srv.Close)
+
+	endpointID := seedEndpoint(t, h.srv.URL)
+	for i := range n {
+		seedDelivery(t, endpointID, fmt.Appendf(nil, `{"hang":%d}`, i))
+	}
+	exec(t, `UPDATE deliveries SET next_attempt_at = now() - interval '1 minute' WHERE endpoint_id = $1`, endpointID)
+	return h
+}
+
+// unblock lets held requests finish. Register it after startWorker, so it runs
+// before the worker's stop and shutdown does not wait out HTTPTimeout.
+func (h *hangingEndpoint) unblock() { close(h.release) }
+
+func (h *hangingEndpoint) inFlight() (current, peak int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.current, h.peak
+}
+
+// hangConfig gives a hanging endpoint a timeout far longer than a healthy
+// delivery takes, so being stuck behind it is unmistakable.
+func hangConfig(workers int, maxInFlight int32) delivery.Config {
+	cfg := testConfig
+	cfg.HTTPTimeout = 5 * time.Second
+	cfg.Lease = 10 * time.Second
+	cfg.Workers = workers
+	cfg.MaxInFlight = maxInFlight
+	return cfg
+}
+
+// Invariant 5: a hanging endpoint with a backlog must not delay deliveries to
+// other endpoints. Without the per-endpoint cap, the hanging endpoint's older
+// rows would take every worker for a full HTTPTimeout.
+func TestHangingEndpointDoesNotDelayOthers(t *testing.T) {
+	reset(t)
+	hang := newHangingEndpoint(t, 10)
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(healthy.Close)
+	id := seed(t, healthy.URL, []byte(`{}`))
+
+	cfg := hangConfig(3, 1)
+	start := time.Now()
+	startWorker(t, cfg)
+	t.Cleanup(hang.unblock)
+
+	waitStatus(t, id, "sent")
+	if elapsed, limit := time.Since(start), cfg.HTTPTimeout/2; elapsed > limit {
+		t.Errorf("healthy delivery sent after %v, want < %v (stuck behind the hanging endpoint)", elapsed, limit)
+	}
+}
+
+// Invariant 5: an endpoint never holds more than MaxInFlight workers, even
+// when the rest of the pool is idle.
+func TestCapLimitsInFlightPerEndpoint(t *testing.T) {
+	reset(t)
+	hang := newHangingEndpoint(t, 10)
+
+	cfg := hangConfig(4, 2)
+	startWorker(t, cfg)
+	t.Cleanup(hang.unblock)
+
+	deadline := time.Now().Add(cfg.HTTPTimeout / 2)
+	for {
+		if current, _ := hang.inFlight(); current >= int(cfg.MaxInFlight) {
+			break
+		}
+		if time.Now().After(deadline) {
+			current, _ := hang.inFlight()
+			t.Fatalf("endpoint holds %d requests, want %d (pool not running in parallel)", current, cfg.MaxInFlight)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Give the idle workers several poll cycles to (wrongly) claim more.
+	time.Sleep(20 * cfg.PollInterval)
+
+	if _, peak := hang.inFlight(); peak != int(cfg.MaxInFlight) {
+		t.Errorf("endpoint held up to %d requests at once, want at most %d", peak, cfg.MaxInFlight)
+	}
 }

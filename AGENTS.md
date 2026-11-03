@@ -75,6 +75,11 @@ asks for a change, use `build` in green, `pair` in yellow, and `tutor` in red.
   experiment that confirms or rules out each, and fix only after the cause is
   confirmed. In the red zone, guide; do not fix.
 
+Keep every explanation short: aim for under 100 words, never more than 200,
+in every mode. One concept per reply, with context first. When a topic needs
+more (for example `research` findings), give the short version and offer the
+details; send them only if the owner asks.
+
 ## Reference implementations
 
 forflow learns from existing webhook products. When the owner asks about a
