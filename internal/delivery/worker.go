@@ -214,7 +214,10 @@ func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult
 	if err != nil {
 		return sendResult{outcome: outcomeEndpointFailed, errorKind: errorKind(err), duration: duration}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
 
 	code := int32(resp.StatusCode)
