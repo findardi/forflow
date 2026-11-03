@@ -13,22 +13,35 @@ import (
 
 const claimDelivery = `-- name: ClaimDelivery :one
 update deliveries d
-set status = 'processing', 
-    lease_id = uuidv7(), 
+set status = 'processing',
+    lease_id = uuidv7(),
     next_attempt_at = now() + $1::interval
 from messages m, endpoints e
 where d.id = (
-    select id from deliveries
-    where status in ('pending', 'processing')
-    and next_attempt_at <= now()
-    order by next_attempt_at asc
+    select c.id
+    from deliveries c
+    join endpoints ce on ce.id = c.endpoint_id
+    where c.status in ('pending', 'processing')
+    and c.next_attempt_at <= now()
+    and (
+        select count(*) from deliveries f
+        where f.endpoint_id = ce.id
+        and f.status = 'processing'
+        and f.next_attempt_at > now()
+    ) < $2::int
+    order by c.next_attempt_at asc
     limit 1
-    for update skip locked
+    for update of c, ce skip locked
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
 returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret
 `
+
+type ClaimDeliveryParams struct {
+	Lease       pgtype.Interval
+	MaxInFlight int32
+}
 
 type ClaimDeliveryRow struct {
 	ID           pgtype.UUID
@@ -40,8 +53,8 @@ type ClaimDeliveryRow struct {
 	Secret       []byte
 }
 
-func (q *Queries) ClaimDelivery(ctx context.Context, lease pgtype.Interval) (ClaimDeliveryRow, error) {
-	row := q.db.QueryRow(ctx, claimDelivery, lease)
+func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (ClaimDeliveryRow, error) {
+	row := q.db.QueryRow(ctx, claimDelivery, arg.Lease, arg.MaxInFlight)
 	var i ClaimDeliveryRow
 	err := row.Scan(
 		&i.ID,

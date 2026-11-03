@@ -96,6 +96,8 @@ var testConfig = delivery.Config{
 	HTTPTimeout:  500 * time.Millisecond,
 	Lease:        5 * time.Second,
 	PollInterval: 50 * time.Millisecond,
+	Workers:      1,
+	MaxInFlight:  1,
 }
 
 // startWorker runs w until the test ends and returns a stop func that

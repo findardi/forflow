@@ -76,6 +76,8 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		Lease:        60 * time.Second,
 		PollInterval: time.Second,
 		Logger:       log,
+		Workers:      cfg.WorkerCount,
+		MaxInFlight:  int32(cfg.WorkerMaxInFlight),
 	})
 
 	log.Info("worker started")

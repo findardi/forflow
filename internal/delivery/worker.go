@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	"forflow/internal/signing"
 	"forflow/internal/store/sqlc"
@@ -57,6 +58,8 @@ type Config struct {
 	Lease        time.Duration
 	PollInterval time.Duration
 	Logger       *slog.Logger
+	Workers      int
+	MaxInFlight  int32
 }
 
 // New returns a Worker that uses pool for claims and outcomes.
@@ -86,6 +89,18 @@ func New(pool *pgxpool.Pool, cfg Config) *Worker {
 // Run claims and delivers until ctx is cancelled. An attempt already in
 // flight when ctx is cancelled runs to completion before Run returns.
 func (w *Worker) Run(ctx context.Context) error {
+	wg, ctx := errgroup.WithContext(ctx)
+
+	for range w.cfg.Workers {
+		wg.Go(func() error {
+			return w.loop(ctx)
+		})
+
+	}
+	return wg.Wait()
+}
+
+func (w *Worker) loop(ctx context.Context) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -120,7 +135,10 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) claim(ctx context.Context) (sqlc.ClaimDeliveryRow, bool, error) {
-	job, err := w.q.ClaimDelivery(ctx, w.lease)
+	job, err := w.q.ClaimDelivery(ctx, sqlc.ClaimDeliveryParams{
+		Lease:       w.lease,
+		MaxInFlight: w.cfg.MaxInFlight,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return job, false, nil
 	}
