@@ -160,6 +160,18 @@ func (q *Queries) MarkSent(ctx context.Context, arg MarkSentParams) (int64, erro
 	return result.RowsAffected(), nil
 }
 
+const notifyDeliveries = `-- name: NotifyDeliveries :exec
+select pg_notify('forflow_deliveries', '')
+`
+
+// NotifyDeliveries wakes idle workers. Postgres delivers it only when the
+// calling transaction commits, so a rolled-back ingest never wakes anyone.
+// The channel name must match the LISTEN in internal/scheduler.
+func (q *Queries) NotifyDeliveries(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, notifyDeliveries)
+	return err
+}
+
 const releaseLease = `-- name: ReleaseLease :execrows
 update deliveries
 set
