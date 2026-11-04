@@ -9,10 +9,12 @@ package delivery_test
 //	(*Worker).Run(ctx) error  // returns nil once ctx is cancelled and in-flight work is done
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -433,6 +436,10 @@ func TestLostLeaseDropsResult(t *testing.T) {
 	if r.Status != "processing" || r.Attempted || r.AttemptCount != 0 {
 		t.Errorf("stolen row = %+v, want untouched processing row", r)
 	}
+	// The new lease holder logs its own attempt; the stale one must not.
+	if n := len(attemptsOf(t, stolenID)); n != 0 {
+		t.Errorf("stolen row has %d attempts, want 0", n)
+	}
 }
 
 // Invariant 4: the endpoint receives exactly the stored bytes.
@@ -836,5 +843,164 @@ func TestCapLimitsInFlightPerEndpoint(t *testing.T) {
 
 	if _, peak := hang.inFlight(); peak != int(cfg.MaxInFlight) {
 		t.Errorf("endpoint held up to %d requests at once, want at most %d", peak, cfg.MaxInFlight)
+	}
+}
+
+type attemptRow struct {
+	Number         int32
+	Succeeded      bool
+	ResponseStatus *int32
+	ErrorKind      *string
+	CreatedAt      time.Time
+}
+
+func (a attemptRow) String() string {
+	kind := "NULL"
+	if a.ErrorKind != nil {
+		kind = *a.ErrorKind
+	}
+	return fmt.Sprintf("#%d succeeded=%v response_status=%v error_kind=%s",
+		a.Number, a.Succeeded, deref(a.ResponseStatus), kind)
+}
+
+// attemptsOf returns the delivery's attempt log, oldest first.
+func attemptsOf(t *testing.T, deliveryID string) []attemptRow {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT attempt_number, succeeded, response_status, error_kind, created_at
+		FROM attempts WHERE delivery_id = $1
+		ORDER BY created_at, id`, deliveryID)
+	if err != nil {
+		t.Fatalf("query attempts: %v", err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[attemptRow])
+	if err != nil {
+		t.Fatalf("scan attempts: %v", err)
+	}
+	return got
+}
+
+// Every contact with the endpoint leaves its own attempts row, so a retried
+// delivery keeps its whole history instead of only the last result.
+func TestEachAttemptIsLogged(t *testing.T) {
+	reset(t)
+	srv, _ := recordingServer(t, http.StatusServiceUnavailable)
+
+	id := seed(t, srv.URL, []byte(`{}`))
+	startWorker(t, testConfig)
+	waitAttempts(t, id, 1)
+	exec(t, `UPDATE deliveries SET next_attempt_at = now() WHERE id = $1`, id)
+	waitStatus(t, id, "sent")
+
+	got := attemptsOf(t, id)
+	want := []string{
+		"#1 succeeded=false response_status=503 error_kind=NULL",
+		"#2 succeeded=true response_status=200 error_kind=NULL",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d attempts %v, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i].String() != want[i] {
+			t.Errorf("attempt %d = %s, want %s", i+1, got[i], want[i])
+		}
+	}
+	if !got[0].CreatedAt.Before(got[1].CreatedAt) {
+		t.Errorf("created_at %v then %v, want increasing", got[0].CreatedAt, got[1].CreatedAt)
+	}
+}
+
+// A transport failure has no response, so the attempt carries its error label
+// and the time the attempt started.
+func TestTransportFailureIsLogged(t *testing.T) {
+	reset(t)
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close() // nothing listens on this port any more
+
+	id := seed(t, srv.URL, []byte(`{}`))
+	start := time.Now()
+	startWorker(t, testConfig)
+	waitAttempts(t, id, 1)
+
+	got := attemptsOf(t, id)
+	if len(got) != 1 {
+		t.Fatalf("got %d attempts %v, want 1", len(got), got)
+	}
+	if want := "#1 succeeded=false response_status=NULL error_kind=conn_refused"; got[0].String() != want {
+		t.Errorf("attempt = %s, want %s", got[0], want)
+	}
+	if at := got[0].CreatedAt; at.Before(start.Add(-time.Second)) || at.After(time.Now()) {
+		t.Errorf("created_at = %v, want the attempt start (after %v)", at, start)
+	}
+}
+
+// logBuffer collects worker logs so a test can wait for a specific event.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) contains(s string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return bytes.Contains(l.b.Bytes(), []byte(s))
+}
+
+// Invariant 1: when the attempt cannot be logged (here: no partition), the
+// outcome rolls back with it. The lease expires and the delivery is sent again
+// without spending an attempt, instead of ending up sent with no history.
+func TestUnloggableAttemptIsRetried(t *testing.T) {
+	reset(t)
+	exec(t, dropAllAttemptPartitions)
+	t.Cleanup(func() { exec(t, `SELECT ensure_attempt_partitions(3)`) })
+
+	var mu sync.Mutex
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+	}))
+	defer srv.Close()
+
+	id := seed(t, srv.URL, []byte(`{}`))
+	logs := &logBuffer{}
+	cfg := testConfig
+	cfg.Logger = slog.New(slog.NewTextHandler(logs, nil))
+	startWorker(t, cfg)
+
+	// Restoring partitions before record has failed would let it succeed.
+	deadline := time.Now().Add(10 * time.Second)
+	for !logs.contains("insert attempt") {
+		if time.Now().After(deadline) {
+			t.Fatal("worker never failed to insert the attempt")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if r := get(t, id); r.Status != "processing" || r.AttemptCount != 0 {
+		t.Fatalf("after failed insert: %+v, want processing with 0 attempts (outcome rolled back)", r)
+	}
+
+	exec(t, `SELECT ensure_attempt_partitions(3)`)
+	// Expire the lease instead of waiting it out.
+	exec(t, `UPDATE deliveries SET next_attempt_at = now() WHERE id = $1`, id)
+	r := waitStatus(t, id, "sent")
+
+	if r.AttemptCount != 1 {
+		t.Errorf("attempt_count = %d, want 1 (the failed record must not spend an attempt)", r.AttemptCount)
+	}
+	if n := len(attemptsOf(t, id)); n != 1 {
+		t.Errorf("got %d attempts, want 1", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 2 {
+		t.Errorf("endpoint called %d times, want 2 (sent again after the rollback)", hits)
 	}
 }
