@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"forflow/internal/config"
@@ -68,6 +69,24 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return err
 	}
 	defer pool.Close()
+
+	// The first run is fatal, so a missing schema or partition stops startup
+	// instead of failing every attempt insert later.
+	// ponytail: assumes one worker process; concurrent runs can race on CREATE
+	// TABLE IF NOT EXISTS. Add a pg_advisory_xact_lock when scaling out.
+	q := sqlc.New(pool)
+	retention := int32(cfg.AttemptsRetentionDays)
+	if err := maintainPartitions(ctx, q, retention); err != nil {
+		return err
+	}
+
+	// cancel runs before Wait (defers are LIFO), so maintenance also stops
+	// when Run returns an error, and both finish before the pool closes.
+	ctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer cancel()
+	wg.Go(func() { runPartitionMaintenance(ctx, q, retention, log) })
 
 	// ponytail: hardcoded v0 values; move to config when they need tuning per deploy.
 	// Lease must exceed HTTPTimeout, or slow but healthy attempts get delivered twice.

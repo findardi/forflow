@@ -190,6 +190,7 @@ type sendResult struct {
 	responseStatus *int32 // nil when no HTTP response was received
 	errorKind      string // short fixed label; never err.Error(), which may carry customer URLs
 	duration       time.Duration
+	startedAt      time.Time
 }
 
 func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult {
@@ -212,7 +213,7 @@ func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult
 	resp, err := w.httpClient.Do(req)
 	duration := w.now().Sub(start)
 	if err != nil {
-		return sendResult{outcome: outcomeEndpointFailed, errorKind: errorKind(err), duration: duration}
+		return sendResult{outcome: outcomeEndpointFailed, errorKind: errorKind(err), duration: duration, startedAt: start}
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -221,7 +222,7 @@ func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
 
 	code := int32(resp.StatusCode)
-	result := sendResult{outcome: outcomeEndpointFailed, responseStatus: &code, duration: duration}
+	result := sendResult{outcome: outcomeEndpointFailed, responseStatus: &code, duration: duration, startedAt: start}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		result.outcome = outcomeSent
 	}
@@ -263,32 +264,42 @@ func tenPercentJitter(d time.Duration) time.Duration {
 	return d + rand.N(d/10)
 }
 
-// record stores the attempt's outcome. Errors are logged, not returned: a lost
-// lease means another worker owns the row, and a database error leaves the
-// lease to expire so the row is claimed again without spending an attempt.
+// record stores the attempt's outcome and its attempts row in one transaction.
+// Errors are logged, not returned: a lost lease means another worker owns the
+// row, and a database error leaves the lease to expire so the row is claimed
+// again without spending an attempt.
 func (w *Worker) record(ctx context.Context, job sqlc.ClaimDeliveryRow, res sendResult) {
 	var code pgtype.Int4
 	if res.responseStatus != nil {
 		code = pgtype.Int4{Int32: *res.responseStatus, Valid: true}
 	}
 
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		w.log.Error("begin record", "delivery_id", job.ID.String(), "error", err)
+		return
+	}
+
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	q := w.q.WithTx(tx)
+
 	var (
 		rows   int64
-		err    error
 		status string
 	)
+
 	switch res.outcome {
 	case outcomeSent:
 		status = "sent"
-		rows, err = w.q.MarkSent(ctx, sqlc.MarkSentParams{ID: job.ID, LeaseID: job.LeaseID, ResponseStatus: code})
+		rows, err = q.MarkSent(ctx, sqlc.MarkSentParams{ID: job.ID, LeaseID: job.LeaseID, ResponseStatus: code})
 	case outcomeDiscarded:
 		status = "discarded"
-		rows, err = w.q.MarkDiscarded(ctx, sqlc.MarkDiscardedParams{ID: job.ID, LeaseID: job.LeaseID})
+		rows, err = q.MarkDiscarded(ctx, sqlc.MarkDiscardedParams{ID: job.ID, LeaseID: job.LeaseID})
 	case outcomeEndpointFailed:
 		if wait, ok := nextRetry(job.AttemptCount); ok {
 			status = "retry"
 			next := w.now().Add(w.jitter(wait)).UTC()
-			rows, err = w.q.ScheduleRetry(ctx, sqlc.ScheduleRetryParams{
+			rows, err = q.ScheduleRetry(ctx, sqlc.ScheduleRetryParams{
 				ID:             job.ID,
 				LeaseID:        job.LeaseID,
 				ResponseStatus: code,
@@ -296,7 +307,31 @@ func (w *Worker) record(ctx context.Context, job sqlc.ClaimDeliveryRow, res send
 			})
 		} else {
 			status = "failed"
-			rows, err = w.q.MarkFailed(ctx, sqlc.MarkFailedParams{ID: job.ID, LeaseID: job.LeaseID, ResponseStatus: code})
+			rows, err = q.MarkFailed(ctx, sqlc.MarkFailedParams{ID: job.ID, LeaseID: job.LeaseID, ResponseStatus: code})
+		}
+	}
+
+	// A discarded delivery never reached the endpoint, so it is not an attempt.
+	if err == nil && rows > 0 && res.outcome != outcomeDiscarded {
+		var kind pgtype.Text
+		if res.errorKind != "" {
+			kind = pgtype.Text{String: res.errorKind, Valid: true}
+		}
+		if err = q.InsertAttempt(ctx, sqlc.InsertAttemptParams{
+			DeliveryID:     job.ID,
+			AttemptNumber:  job.AttemptCount + 1,
+			Succeeded:      res.outcome == outcomeSent,
+			ResponseStatus: code,
+			ErrorKind:      kind,
+			DurationMs:     int32(res.duration.Milliseconds()),
+			CreatedAt:      pgtype.Timestamptz{Time: res.startedAt.UTC(), Valid: true},
+		}); err != nil {
+			err = fmt.Errorf("insert attempt: %w", err)
+		}
+	}
+	if err == nil && rows > 0 {
+		if err = tx.Commit(ctx); err != nil {
+			err = fmt.Errorf("commit record: %w", err)
 		}
 	}
 

@@ -17,6 +17,9 @@ type Config struct {
 	// WorkerMaxInFlight caps concurrent deliveries per endpoint, so a hanging
 	// endpoint holds at most this many of the WorkerCount slots.
 	WorkerMaxInFlight int
+	// AttemptsRetentionDays is how many past days of attempts are kept besides
+	// today; older daily partitions are dropped.
+	AttemptsRetentionDays int
 }
 
 // Load reads the environment and fails fast on missing required values,
@@ -35,6 +38,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.WorkerMaxInFlight, err = getEnvPositiveInt("WORKER_MAX_IN_FLIGHT", 4); err != nil {
+		return Config{}, err
+	}
+	if cfg.AttemptsRetentionDays, err = getEnvPositiveInt("ATTEMPTS_RETENTION_DAYS", 30); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

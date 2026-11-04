@@ -8,6 +8,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type Attempt struct {
+	ID             pgtype.UUID
+	DeliveryID     pgtype.UUID
+	AttemptNumber  int32
+	Succeeded      bool
+	ResponseStatus pgtype.Int4
+	ErrorKind      pgtype.Text
+	DurationMs     int32
+	CreatedAt      pgtype.Timestamptz
+}
+
 type Delivery struct {
 	ID             pgtype.UUID
 	MessageID      pgtype.UUID
