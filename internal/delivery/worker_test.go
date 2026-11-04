@@ -130,7 +130,7 @@ func startWorker(t *testing.T, cfg delivery.Config) (stop func() (time.Duration,
 
 func reset(t *testing.T) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), "TRUNCATE deliveries, messages, endpoints"); err != nil {
+	if _, err := pool.Exec(context.Background(), "TRUNCATE attempts, deliveries, messages, endpoints"); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 }
