@@ -128,6 +128,35 @@ func TestCreateNotifiesWorkers(t *testing.T) {
 	}
 }
 
+// A disabled endpoint gets no new deliveries; only its existing backlog waits.
+func TestCreateSkipsDisabledEndpoints(t *testing.T) {
+	reset(t)
+	var enabled string
+	err := pool.QueryRow(context.Background(), `
+		WITH a AS (INSERT INTO endpoints (url, secret) VALUES ('http://a.invalid/', $1) RETURNING id),
+		     b AS (INSERT INTO endpoints (url, secret, disabled_at) VALUES ('http://b.invalid/', $1, now()) RETURNING id)
+		SELECT a.id::text FROM a, b`, []byte("forflow-test-signing-secret-32b!")).Scan(&enabled)
+	if err != nil {
+		t.Fatalf("seed endpoints: %v", err)
+	}
+
+	msg, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deliveries = %d, want 1 (disabled endpoint skipped)", n)
+	}
+	var got string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT endpoint_id::text FROM deliveries WHERE message_id = $1`, msg.ID).Scan(&got); err != nil {
+		t.Fatalf("read delivery: %v", err)
+	}
+	if got != enabled {
+		t.Errorf("delivery went to endpoint %s, want the enabled one %s", got, enabled)
+	}
+}
+
 func TestCreateWithoutDeliveriesDoesNotNotify(t *testing.T) {
 	reset(t)
 	conn := listen(t)

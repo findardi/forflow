@@ -63,6 +63,16 @@ type Config struct {
 	Logger       *slog.Logger
 	Workers      int
 	MaxInFlight  int32
+
+	// BreakerThreshold is the failure streak that opens an endpoint's breaker.
+	BreakerThreshold int32
+	// BreakerCooldown is the first pause once the breaker opens. Each further
+	// failure (a failed half-open probe) doubles it, up to BreakerMaxCooldown.
+	BreakerCooldown    time.Duration
+	BreakerMaxCooldown time.Duration
+	// DisableAfter is how long an endpoint may fail without a single success
+	// before it is disabled and needs a human to enable it again.
+	DisableAfter time.Duration
 }
 
 // New returns a Worker that uses pool for claims and outcomes.
@@ -165,7 +175,10 @@ func (w *Worker) claim(ctx context.Context) (sqlc.ClaimDeliveryRow, bool, error)
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	q := w.q.WithTx(tx)
 
-	endpointID, err := q.LockClaimableEndpoint(ctx, w.cfg.MaxInFlight)
+	endpointID, err := q.LockClaimableEndpoint(ctx, sqlc.LockClaimableEndpointParams{
+		BreakerThreshold: w.cfg.BreakerThreshold,
+		MaxInFlight:      w.cfg.MaxInFlight,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return sqlc.ClaimDeliveryRow{}, false, nil
 	}
@@ -174,9 +187,10 @@ func (w *Worker) claim(ctx context.Context) (sqlc.ClaimDeliveryRow, bool, error)
 	}
 
 	job, err := q.ClaimDelivery(ctx, sqlc.ClaimDeliveryParams{
-		Lease:       w.lease,
-		EndpointID:  endpointID,
-		MaxInFlight: w.cfg.MaxInFlight,
+		Lease:            w.lease,
+		EndpointID:       endpointID,
+		BreakerThreshold: w.cfg.BreakerThreshold,
+		MaxInFlight:      w.cfg.MaxInFlight,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The fresh count found the endpoint at its cap; the coarse filter was stale.
@@ -279,7 +293,8 @@ func tenPercentJitter(d time.Duration) time.Duration {
 	return d + rand.N(d/10)
 }
 
-// record stores the attempt's outcome and its attempts row in one transaction.
+// record stores the attempt's outcome, its attempts row and the endpoint's
+// health in one transaction.
 // Errors are logged, not returned: a lost lease means another worker owns the
 // row, and a database error leaves the lease to expire so the row is claimed
 // again without spending an attempt.
@@ -344,6 +359,10 @@ func (w *Worker) record(ctx context.Context, job sqlc.ClaimDeliveryRow, res send
 			err = fmt.Errorf("insert attempt: %w", err)
 		}
 	}
+	var disabled bool
+	if err == nil && rows > 0 {
+		disabled, err = w.recordHealth(ctx, q, job, res.outcome)
+	}
 	if err == nil && rows > 0 {
 		if err = tx.Commit(ctx); err != nil {
 			err = fmt.Errorf("commit record: %w", err)
@@ -369,7 +388,39 @@ func (w *Worker) record(ctx context.Context, job sqlc.ClaimDeliveryRow, res send
 		w.log.Warn("lease lost before recording outcome", attrs...)
 	default:
 		w.log.Info("delivery attempt recorded", attrs...)
+		if disabled {
+			w.log.Warn("endpoint disabled", "endpoint_id", job.EndpointID.String(), "delivery_id", job.ID.String())
+		}
 	}
+}
+
+// recordHealth feeds the attempt into the endpoint's breaker and auto-disable
+// state. It runs in the record transaction, after the lease-fenced update, so
+// an outcome that is rolled back or dropped never counts against the endpoint.
+// A discarded delivery never reached the endpoint and says nothing about it.
+func (w *Worker) recordHealth(ctx context.Context, q *sqlc.Queries, job sqlc.ClaimDeliveryRow, o outcome) (disabled bool, err error) {
+	switch o {
+	case outcomeSent:
+		if err := q.RecordEndpointSuccess(ctx, job.EndpointID); err != nil {
+			return false, fmt.Errorf("record endpoint success: %w", err)
+		}
+	case outcomeEndpointFailed:
+		disabled, err = q.RecordEndpointFailure(ctx, sqlc.RecordEndpointFailureParams{
+			ID:           job.EndpointID,
+			Threshold:    w.cfg.BreakerThreshold,
+			BaseCooldown: interval(w.cfg.BreakerCooldown),
+			MaxCooldown:  interval(w.cfg.BreakerMaxCooldown),
+			DisableAfter: interval(w.cfg.DisableAfter),
+		})
+		if err != nil {
+			return false, fmt.Errorf("record endpoint failure: %w", err)
+		}
+	}
+	return disabled, nil
+}
+
+func interval(d time.Duration) pgtype.Interval {
+	return pgtype.Interval{Microseconds: d.Microseconds(), Valid: true}
 }
 
 func (w *Worker) release(ctx context.Context, job sqlc.ClaimDeliveryRow) {

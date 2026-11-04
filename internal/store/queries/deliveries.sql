@@ -1,9 +1,11 @@
 -- name: CreateDeliveriesForMessage :execrows
+-- Disabled endpoints get no new deliveries; their backlog waits for re-enable.
 insert into deliveries
     (message_id, endpoint_id)
 select
     $1, id
-from endpoints;
+from endpoints
+where disabled_at is null;
 
 -- NotifyDeliveries wakes idle workers. Postgres delivers it only when the
 -- calling transaction commits, so a rolled-back ingest never wakes anyone.

@@ -95,12 +95,18 @@ func migrateUp(ctx context.Context) error {
 	return nil
 }
 
+// The breaker is set far out of reach so tests that predate it keep testing
+// retries alone; breaker_test.go narrows it.
 var testConfig = delivery.Config{
-	HTTPTimeout:  500 * time.Millisecond,
-	Lease:        5 * time.Second,
-	PollInterval: 50 * time.Millisecond,
-	Workers:      1,
-	MaxInFlight:  1,
+	HTTPTimeout:        500 * time.Millisecond,
+	Lease:              5 * time.Second,
+	PollInterval:       50 * time.Millisecond,
+	Workers:            1,
+	MaxInFlight:        1,
+	BreakerThreshold:   1000,
+	BreakerCooldown:    time.Second,
+	BreakerMaxCooldown: time.Second,
+	DisableAfter:       1000 * time.Hour,
 }
 
 // startWorker runs w until the test ends and returns a stop func that
