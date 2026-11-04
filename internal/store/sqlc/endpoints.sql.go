@@ -16,7 +16,7 @@ insert into endpoints
     (url, secret)
 values
     ($1, $2)
-returning id, url, created_at, secret
+returning id, url, created_at, secret, consecutive_failures, first_failure_at, paused_until, disabled_at
 `
 
 type CreateEndpointParams struct {
@@ -32,12 +32,36 @@ func (q *Queries) CreateEndpoint(ctx context.Context, arg CreateEndpointParams) 
 		&i.Url,
 		&i.CreatedAt,
 		&i.Secret,
+		&i.ConsecutiveFailures,
+		&i.FirstFailureAt,
+		&i.PausedUntil,
+		&i.DisabledAt,
 	)
 	return i, err
 }
 
+const enableEndpoint = `-- name: EnableEndpoint :execrows
+update endpoints
+set disabled_at = null,
+    consecutive_failures = 0,
+    first_failure_at = null,
+    paused_until = null
+where id = $1
+`
+
+// Clears the disable and the whole failure streak: a kept first_failure_at
+// would disable the endpoint again on its next failure. The held backlog is
+// already due, so it flows again under the normal per-endpoint cap.
+func (q *Queries) EnableEndpoint(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, enableEndpoint, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getEndpointByID = `-- name: GetEndpointByID :one
-select id, url, created_at, secret from endpoints where id = $1
+select id, url, created_at, secret, consecutive_failures, first_failure_at, paused_until, disabled_at from endpoints where id = $1
 `
 
 func (q *Queries) GetEndpointByID(ctx context.Context, id pgtype.UUID) (Endpoint, error) {
@@ -48,6 +72,78 @@ func (q *Queries) GetEndpointByID(ctx context.Context, id pgtype.UUID) (Endpoint
 		&i.Url,
 		&i.CreatedAt,
 		&i.Secret,
+		&i.ConsecutiveFailures,
+		&i.FirstFailureAt,
+		&i.PausedUntil,
+		&i.DisabledAt,
 	)
 	return i, err
+}
+
+const recordEndpointFailure = `-- name: RecordEndpointFailure :one
+update endpoints
+set consecutive_failures = consecutive_failures + 1,
+    first_failure_at = coalesce(first_failure_at, now()),
+    paused_until = case
+        when paused_until > now() then paused_until
+        when consecutive_failures + 1 >= $1::int then
+            now() + least(
+                $2::interval
+                    * power(2, least(consecutive_failures + 1 - $1::int, 20)),
+                $3::interval)
+        else paused_until
+    end,
+    disabled_at = case
+        when disabled_at is null
+         and now() - first_failure_at >= $4::interval then now()
+        else disabled_at
+    end
+where id = $5
+returning coalesce(disabled_at = now(), false)::bool as disabled_now
+`
+
+type RecordEndpointFailureParams struct {
+	Threshold    int32
+	BaseCooldown pgtype.Interval
+	MaxCooldown  pgtype.Interval
+	DisableAfter pgtype.Interval
+	ID           pgtype.UUID
+}
+
+// Extends the failure streak. From the threshold on, the breaker opens for a
+// cooldown that doubles with each further failure, capped at max_cooldown.
+// Failures that land while the breaker is already open (attempts claimed
+// before it opened) keep the current pause instead of extending it. A streak
+// older than disable_after disables the endpoint. SET expressions read the row
+// as it was before this update. disabled_now is true only for the call that
+// disabled it, so the caller logs the transition once.
+func (q *Queries) RecordEndpointFailure(ctx context.Context, arg RecordEndpointFailureParams) (bool, error) {
+	row := q.db.QueryRow(ctx, recordEndpointFailure,
+		arg.Threshold,
+		arg.BaseCooldown,
+		arg.MaxCooldown,
+		arg.DisableAfter,
+		arg.ID,
+	)
+	var disabled_now bool
+	err := row.Scan(&disabled_now)
+	return disabled_now, err
+}
+
+const recordEndpointSuccess = `-- name: RecordEndpointSuccess :exec
+
+update endpoints
+set consecutive_failures = 0,
+    first_failure_at = null,
+    paused_until = null
+where id = $1 and consecutive_failures > 0
+`
+
+// Health queries run in the record transaction, after the lease-fenced outcome
+// update succeeded, so an attempt that lost its lease never touches the endpoint.
+// Any 2xx closes the breaker. Skips the write when there is no streak, so the
+// common path adds no row update.
+func (q *Queries) RecordEndpointSuccess(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, recordEndpointSuccess, id)
+	return err
 }

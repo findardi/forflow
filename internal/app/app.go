@@ -95,12 +95,16 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	// New events arrive through the listener, so PollInterval only bounds how
 	// late due retries, expired leases and lost notifications are picked up.
 	w := delivery.New(pool, delivery.Config{
-		HTTPTimeout:  30 * time.Second,
-		Lease:        60 * time.Second,
-		PollInterval: 5 * time.Second,
-		Logger:       log,
-		Workers:      cfg.WorkerCount,
-		MaxInFlight:  int32(cfg.WorkerMaxInFlight),
+		HTTPTimeout:        30 * time.Second,
+		Lease:              60 * time.Second,
+		PollInterval:       5 * time.Second,
+		Logger:             log,
+		Workers:            cfg.WorkerCount,
+		MaxInFlight:        int32(cfg.WorkerMaxInFlight),
+		BreakerThreshold:   int32(cfg.BreakerThreshold),
+		BreakerCooldown:    cfg.BreakerCooldown,
+		BreakerMaxCooldown: cfg.BreakerMaxCooldown,
+		DisableAfter:       cfg.EndpointDisableAfter,
 	})
 	wg.Go(func() {
 		if err := scheduler.Listen(ctx, pool.Config().ConnConfig, w.Wake, log); err != nil {

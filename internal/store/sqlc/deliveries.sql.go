@@ -17,8 +17,10 @@ insert into deliveries
 select
     $1, id
 from endpoints
+where disabled_at is null
 `
 
+// Disabled endpoints get no new deliveries; their backlog waits for re-enable.
 func (q *Queries) CreateDeliveriesForMessage(ctx context.Context, messageID pgtype.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, createDeliveriesForMessage, messageID)
 	if err != nil {

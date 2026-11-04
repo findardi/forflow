@@ -20,6 +20,7 @@ from messages m, endpoints e
 where d.id = (
     select c.id
     from deliveries c
+    join endpoints ce on ce.id = c.endpoint_id
     where c.endpoint_id = $2::uuid
     and c.status in ('pending', 'processing')
     and c.next_attempt_at <= now()
@@ -28,24 +29,29 @@ where d.id = (
         where f.endpoint_id = $2::uuid
         and f.status = 'processing'
         and f.next_attempt_at > now()
-    ) < $3::int
+    ) < case
+        when ce.consecutive_failures >= $3::int then 1
+        else $4::int
+    end
     order by c.next_attempt_at asc
     limit 1
-    for update skip locked
+    for update of c skip locked
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
-returning d.id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret
+returning d.id, d.endpoint_id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret
 `
 
 type ClaimDeliveryParams struct {
-	Lease       pgtype.Interval
-	EndpointID  pgtype.UUID
-	MaxInFlight int32
+	Lease            pgtype.Interval
+	EndpointID       pgtype.UUID
+	BreakerThreshold int32
+	MaxInFlight      int32
 }
 
 type ClaimDeliveryRow struct {
 	ID           pgtype.UUID
+	EndpointID   pgtype.UUID
 	Endpoint     string
 	Payload      []byte
 	LeaseID      pgtype.UUID
@@ -57,10 +63,16 @@ type ClaimDeliveryRow struct {
 // Must run in the transaction that holds the endpoint lock from
 // LockClaimableEndpoint. Returns no row when the endpoint is already at its cap.
 func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (ClaimDeliveryRow, error) {
-	row := q.db.QueryRow(ctx, claimDelivery, arg.Lease, arg.EndpointID, arg.MaxInFlight)
+	row := q.db.QueryRow(ctx, claimDelivery,
+		arg.Lease,
+		arg.EndpointID,
+		arg.BreakerThreshold,
+		arg.MaxInFlight,
+	)
 	var i ClaimDeliveryRow
 	err := row.Scan(
 		&i.ID,
+		&i.EndpointID,
 		&i.Endpoint,
 		&i.Payload,
 		&i.LeaseID,
@@ -78,27 +90,45 @@ from deliveries c
 join endpoints ce on ce.id = c.endpoint_id
 where c.status in ('pending', 'processing')
 and c.next_attempt_at <= now()
+and ce.disabled_at is null
+and (ce.paused_until is null or ce.paused_until <= now())
 and (
     select count(*) from deliveries f
     where f.endpoint_id = ce.id
     and f.status = 'processing'
     and f.next_attempt_at > now()
-) < $1::int
+) < case
+    when ce.consecutive_failures >= $1::int then 1
+    else $2::int
+end
 order by c.next_attempt_at asc
 limit 1
 for update of ce skip locked
 `
+
+type LockClaimableEndpointParams struct {
+	BreakerThreshold int32
+	MaxInFlight      int32
+}
 
 // Claiming is two statements in one transaction. Under READ COMMITTED each
 // statement takes a fresh snapshot, so counting in a second statement, after
 // the endpoint lock is held, sees every claim committed by the lock's previous
 // holder. Counting in the same statement that takes the lock can read a
 // snapshot from before that commit and overshoot the cap.
+//
+// The circuit breaker narrows the cap per endpoint: closed while its failure
+// streak is under breaker_threshold (cap = max_in_flight), open while
+// paused_until is in the future (skipped), half-open after that (cap = 1, so a
+// single probe decides). Disabled endpoints are never claimed; their backlog
+// stays pending until the endpoint is enabled again.
 // Picks the endpoint owning the oldest due delivery and locks its row until the
 // transaction ends. The in-flight count here is only a coarse filter; it may be
-// stale, and ClaimDelivery counts again.
-func (q *Queries) LockClaimableEndpoint(ctx context.Context, maxInFlight int32) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, lockClaimableEndpoint, maxInFlight)
+// stale, and ClaimDelivery counts again. The endpoint conditions need no second
+// check: FOR UPDATE re-evaluates them against the latest row version, and the
+// lock keeps record from changing them until this transaction ends.
+func (q *Queries) LockClaimableEndpoint(ctx context.Context, arg LockClaimableEndpointParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockClaimableEndpoint, arg.BreakerThreshold, arg.MaxInFlight)
 	var endpoint_id pgtype.UUID
 	err := row.Scan(&endpoint_id)
 	return endpoint_id, err

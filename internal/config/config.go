@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config is shared by the api and worker processes.
@@ -20,6 +21,15 @@ type Config struct {
 	// AttemptsRetentionDays is how many past days of attempts are kept besides
 	// today; older daily partitions are dropped.
 	AttemptsRetentionDays int
+	// BreakerThreshold is the failure streak that opens an endpoint's breaker.
+	BreakerThreshold int
+	// BreakerCooldown is the first pause of an open breaker; each further
+	// failure doubles it, up to BreakerMaxCooldown.
+	BreakerCooldown    time.Duration
+	BreakerMaxCooldown time.Duration
+	// EndpointDisableAfter is how long an endpoint may fail without a single
+	// success before it is disabled.
+	EndpointDisableAfter time.Duration
 }
 
 // Load reads the environment and fails fast on missing required values,
@@ -41,6 +51,24 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.AttemptsRetentionDays, err = getEnvPositiveInt("ATTEMPTS_RETENTION_DAYS", 30); err != nil {
+		return Config{}, err
+	}
+	// Defaults: 30s first pause as in Convoy; disable after 5 days of failing,
+	// as in Svix (endpoint_failure_disable_after = 120h).
+	if cfg.BreakerThreshold, err = getEnvPositiveInt("BREAKER_THRESHOLD", 5); err != nil {
+		return Config{}, err
+	}
+	if cfg.BreakerCooldown, err = getEnvPositiveDuration("BREAKER_COOLDOWN", 30*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.BreakerMaxCooldown, err = getEnvPositiveDuration("BREAKER_MAX_COOLDOWN", time.Hour); err != nil {
+		return Config{}, err
+	}
+	if cfg.BreakerMaxCooldown < cfg.BreakerCooldown {
+		return Config{}, fmt.Errorf("config: BREAKER_MAX_COOLDOWN (%v) must not be below BREAKER_COOLDOWN (%v)",
+			cfg.BreakerMaxCooldown, cfg.BreakerCooldown)
+	}
+	if cfg.EndpointDisableAfter, err = getEnvPositiveDuration("ENDPOINT_DISABLE_AFTER", 120*time.Hour); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -66,4 +94,18 @@ func getEnvPositiveInt(key string, fallback int) (int, error) {
 		return 0, fmt.Errorf("config: %s must be a positive integer, got %q", key, v)
 	}
 	return int(n), nil
+}
+
+// getEnvPositiveDuration rejects zero: a zero ENDPOINT_DISABLE_AFTER disables
+// an endpoint on its second failure, and a zero cooldown never pauses at all.
+func getEnvPositiveDuration(key string, fallback time.Duration) (time.Duration, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("config: %s must be a positive duration such as 30s or 120h, got %q", key, v)
+	}
+	return d, nil
 }

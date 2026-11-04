@@ -33,10 +33,14 @@ type Delivery struct {
 }
 
 type Endpoint struct {
-	ID        pgtype.UUID
-	Url       string
-	CreatedAt pgtype.Timestamptz
-	Secret    []byte
+	ID                  pgtype.UUID
+	Url                 string
+	CreatedAt           pgtype.Timestamptz
+	Secret              []byte
+	ConsecutiveFailures int32
+	FirstFailureAt      pgtype.Timestamptz
+	PausedUntil         pgtype.Timestamptz
+	DisabledAt          pgtype.Timestamptz
 }
 
 type Message struct {

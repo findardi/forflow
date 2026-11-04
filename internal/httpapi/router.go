@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"forflow/internal/message"
 	"forflow/internal/signing"
 	"forflow/internal/store/sqlc"
@@ -34,6 +36,7 @@ func NewRouter(q *sqlc.Queries, msg *message.Service, log *slog.Logger) http.Han
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /endpoints", a.createEndpoint)
+	mux.HandleFunc("POST /endpoints/{id}/enable", a.enableEndpoint)
 	mux.HandleFunc("POST /messages", a.createMessage)
 	return mux
 }
@@ -71,6 +74,30 @@ func (a *api) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		"secret":     signing.EncodeSecret(ep.Secret),
 		"created_at": ep.CreatedAt,
 	})
+}
+
+// enableEndpoint turns a disabled endpoint back on and clears its breaker.
+// Re-enabling is a human decision, so it never happens on its own.
+func (a *api) enableEndpoint(w http.ResponseWriter, r *http.Request) {
+	var id pgtype.UUID
+	if err := id.Scan(r.PathValue("id")); err != nil {
+		http.Error(w, "invalid endpoint id", http.StatusBadRequest)
+		return
+	}
+
+	n, err := a.queries.EnableEndpoint(r.Context(), id)
+	if err != nil {
+		a.log.ErrorContext(r.Context(), "enable endpoint", "endpoint_id", id.String(), "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if n == 0 {
+		http.Error(w, "endpoint not found", http.StatusNotFound)
+		return
+	}
+
+	a.log.InfoContext(r.Context(), "endpoint enabled", "endpoint_id", id.String())
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // createMessage treats the whole request body as the payload, so the bytes
