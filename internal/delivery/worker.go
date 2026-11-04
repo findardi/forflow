@@ -47,6 +47,8 @@ type Worker struct {
 	lease      pgtype.Interval
 	httpClient *http.Client
 	log        *slog.Logger
+	// wake holds at most one pending wakeup for an idle loop (see Wake).
+	wake chan struct{}
 	// now and jitter are injected so tests can pin retry times.
 	now    func() time.Time
 	jitter func(time.Duration) time.Duration
@@ -83,8 +85,17 @@ func New(pool *pgxpool.Pool, cfg Config) *Worker {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		log:    log,
+		wake:   make(chan struct{}, 1),
 		now:    time.Now,
 		jitter: tenPercentJitter,
+	}
+}
+
+// Wake tells one idle loop to claim now instead of waiting out PollInterval.
+func (w *Worker) Wake() {
+	select {
+	case w.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -120,10 +131,14 @@ func (w *Worker) loop(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return nil
+			case <-w.wake:
 			case <-time.After(w.cfg.PollInterval):
 			}
 			continue
 		}
+		// More may be due: pass the wakeup on so a burst spreads across loops.
+		// The chain ends at the first loop whose claim comes back empty.
+		w.Wake()
 
 		workCtx := context.WithoutCancel(ctx)
 		if ctx.Err() != nil {

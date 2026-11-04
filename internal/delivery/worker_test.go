@@ -107,9 +107,15 @@ var testConfig = delivery.Config{
 // cancels it and reports how long Run took to return.
 func startWorker(t *testing.T, cfg delivery.Config) (stop func() (time.Duration, error)) {
 	t.Helper()
+	return runWorker(t, delivery.New(pool, cfg))
+}
+
+// runWorker is startWorker for a test that needs the Worker itself.
+func runWorker(t *testing.T, w *delivery.Worker) (stop func() (time.Duration, error)) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- delivery.New(pool, cfg).Run(ctx) }()
+	go func() { done <- w.Run(ctx) }()
 
 	var once sync.Once
 	var elapsed time.Duration
