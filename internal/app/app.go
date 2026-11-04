@@ -14,6 +14,7 @@ import (
 	"forflow/internal/delivery"
 	"forflow/internal/httpapi"
 	"forflow/internal/message"
+	"forflow/internal/scheduler"
 	"forflow/internal/store/sqlc"
 )
 
@@ -80,8 +81,9 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return err
 	}
 
-	// cancel runs before Wait (defers are LIFO), so maintenance also stops
-	// when Run returns an error, and both finish before the pool closes.
+	// cancel runs before Wait (defers are LIFO), so maintenance and the
+	// listener also stop when Run returns an error, and all finish before the
+	// pool closes.
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -90,13 +92,20 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 
 	// ponytail: hardcoded v0 values; move to config when they need tuning per deploy.
 	// Lease must exceed HTTPTimeout, or slow but healthy attempts get delivered twice.
+	// New events arrive through the listener, so PollInterval only bounds how
+	// late due retries, expired leases and lost notifications are picked up.
 	w := delivery.New(pool, delivery.Config{
 		HTTPTimeout:  30 * time.Second,
 		Lease:        60 * time.Second,
-		PollInterval: time.Second,
+		PollInterval: 5 * time.Second,
 		Logger:       log,
 		Workers:      cfg.WorkerCount,
 		MaxInFlight:  int32(cfg.WorkerMaxInFlight),
+	})
+	wg.Go(func() {
+		if err := scheduler.Listen(ctx, pool.Config().ConnConfig, w.Wake, log); err != nil {
+			log.Error("delivery listener stopped", "error", err)
+		}
 	})
 
 	log.Info("worker started")
