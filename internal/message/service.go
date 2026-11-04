@@ -43,6 +43,12 @@ func (s *Service) Create(ctx context.Context, payload []byte) (sqlc.Message, int
 		if err != nil {
 			return fmt.Errorf("insert deliveries: %w", err)
 		}
+		// No deliveries, nothing to wake for.
+		if n > 0 {
+			if err := q.NotifyDeliveries(ctx); err != nil {
+				return fmt.Errorf("notify deliveries: %w", err)
+			}
+		}
 		return nil
 	})
 

@@ -5,6 +5,12 @@ select
     $1, id
 from endpoints;
 
+-- NotifyDeliveries wakes idle workers. Postgres delivers it only when the
+-- calling transaction commits, so a rolled-back ingest never wakes anyone.
+-- The channel name must match the LISTEN in internal/scheduler.
+-- name: NotifyDeliveries :exec
+select pg_notify('forflow_deliveries', '');
+
 -- name: GetDeliveryByID :one
 select * from deliveries where id = $1;
 
