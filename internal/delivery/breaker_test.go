@@ -25,7 +25,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"forflow/internal/delivery"
+	"forflow/internal/store/sqlc"
 )
 
 // countingServer answers every request with status and counts them.
@@ -316,4 +319,35 @@ func TestDiscardedLeavesHealthAlone(t *testing.T) {
 	if h := getHealth(t, ep); h.Failures != 0 || h.Streak {
 		t.Errorf("health = %+v, want untouched (discarded)", h)
 	}
+}
+
+// Re-enabling releases the held backlog, which resumes its retry schedule
+// instead of starting over.
+func TestEnabledEndpointDeliversBacklog(t *testing.T) {
+	reset(t)
+	srv, _ := countingServer(t, http.StatusOK)
+	ep := seedEndpoint(t, srv.URL)
+	exec(t, `UPDATE endpoints SET disabled_at = now() WHERE id = $1`, ep)
+	retried := seedDelivery(t, ep, []byte(`{"n":1}`))
+	exec(t, `UPDATE deliveries SET attempt_count = 2 WHERE id = $1`, retried)
+	held := seedDelivery(t, ep, []byte(`{"n":2}`))
+
+	startWorker(t, breakerConfig(3))
+	time.Sleep(200 * time.Millisecond)
+	if r := get(t, held); r.Status != "pending" {
+		t.Fatalf("held delivery = %+v before enable, want pending", r)
+	}
+
+	var epID pgtype.UUID
+	if err := epID.Scan(ep); err != nil {
+		t.Fatalf("parse endpoint id: %v", err)
+	}
+	if n, err := sqlc.New(pool).EnableEndpoint(context.Background(), epID); err != nil || n != 1 {
+		t.Fatalf("enable: n=%d err=%v", n, err)
+	}
+
+	if r := waitStatus(t, retried, "sent"); r.AttemptCount != 3 {
+		t.Errorf("retried delivery attempt_count = %d, want 3 (schedule continued)", r.AttemptCount)
+	}
+	waitStatus(t, held, "sent")
 }

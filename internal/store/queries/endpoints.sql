@@ -47,3 +47,14 @@ set consecutive_failures = consecutive_failures + 1,
     end
 where id = sqlc.arg(id)
 returning coalesce(disabled_at = now(), false)::bool as disabled_now;
+
+-- name: EnableEndpoint :execrows
+-- Clears the disable and the whole failure streak: a kept first_failure_at
+-- would disable the endpoint again on its next failure. The held backlog is
+-- already due, so it flows again under the normal per-endpoint cap.
+update endpoints
+set disabled_at = null,
+    consecutive_failures = 0,
+    first_failure_at = null,
+    paused_until = null
+where id = $1;

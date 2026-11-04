@@ -40,6 +40,26 @@ func (q *Queries) CreateEndpoint(ctx context.Context, arg CreateEndpointParams) 
 	return i, err
 }
 
+const enableEndpoint = `-- name: EnableEndpoint :execrows
+update endpoints
+set disabled_at = null,
+    consecutive_failures = 0,
+    first_failure_at = null,
+    paused_until = null
+where id = $1
+`
+
+// Clears the disable and the whole failure streak: a kept first_failure_at
+// would disable the endpoint again on its next failure. The held backlog is
+// already due, so it flows again under the normal per-endpoint cap.
+func (q *Queries) EnableEndpoint(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, enableEndpoint, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getEndpointByID = `-- name: GetEndpointByID :one
 select id, url, created_at, secret, consecutive_failures, first_failure_at, paused_until, disabled_at from endpoints where id = $1
 `

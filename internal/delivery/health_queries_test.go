@@ -251,3 +251,29 @@ func TestRecordEndpointSuccess(t *testing.T) {
 		t.Error("disabled_at cleared by a success, want it kept")
 	}
 }
+
+func TestEnableEndpointClearsHealth(t *testing.T) {
+	tx, q := healthTx(t)
+	id := txEndpoint(t, tx, 7, 3*time.Hour, 20*time.Minute)
+	if _, err := tx.Exec(context.Background(),
+		`UPDATE endpoints SET disabled_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+
+	n, err := q.EnableEndpoint(context.Background(), id)
+	if err != nil || n != 1 {
+		t.Fatalf("enable: n=%d err=%v", n, err)
+	}
+	// A kept first_failure_at would disable the endpoint again on its next failure.
+	if h := readTxHealth(t, tx, id); h.Disabled || h.Failures != 0 || h.Streak || h.Paused {
+		t.Errorf("health = %+v, want everything cleared", h)
+	}
+
+	var unknown pgtype.UUID
+	if err := unknown.Scan("01a1a58e-0000-7000-8000-000000000000"); err != nil {
+		t.Fatalf("parse uuid: %v", err)
+	}
+	if n, err := q.EnableEndpoint(context.Background(), unknown); err != nil || n != 0 {
+		t.Errorf("enable unknown endpoint: n=%d err=%v, want 0 rows", n, err)
+	}
+}

@@ -94,8 +94,6 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	// Lease must exceed HTTPTimeout, or slow but healthy attempts get delivered twice.
 	// New events arrive through the listener, so PollInterval only bounds how
 	// late due retries, expired leases and lost notifications are picked up.
-	// Breaker: 30s first pause as in Convoy; disable after 5 days of failing
-	// with no success, as in Svix (endpoint_failure_disable_after = 120h).
 	w := delivery.New(pool, delivery.Config{
 		HTTPTimeout:        30 * time.Second,
 		Lease:              60 * time.Second,
@@ -103,10 +101,10 @@ func RunWorker(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		Logger:             log,
 		Workers:            cfg.WorkerCount,
 		MaxInFlight:        int32(cfg.WorkerMaxInFlight),
-		BreakerThreshold:   5,
-		BreakerCooldown:    30 * time.Second,
-		BreakerMaxCooldown: time.Hour,
-		DisableAfter:       5 * 24 * time.Hour,
+		BreakerThreshold:   int32(cfg.BreakerThreshold),
+		BreakerCooldown:    cfg.BreakerCooldown,
+		BreakerMaxCooldown: cfg.BreakerMaxCooldown,
+		DisableAfter:       cfg.EndpointDisableAfter,
 	})
 	wg.Go(func() {
 		if err := scheduler.Listen(ctx, pool.Config().ConnConfig, w.Wake, log); err != nil {
