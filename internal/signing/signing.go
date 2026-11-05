@@ -72,6 +72,17 @@ func Sign(secret []byte, msgID string, ts time.Time, body []byte) string {
 	return VERSION + "," + base64.StdEncoding.EncodeToString(mac)
 }
 
+// SignAll returns one signature per secret, space separated, which is how the
+// spec carries a key rotation: a consumer accepts the header if any one matches.
+func SignAll(secrets [][]byte, msgID string, ts time.Time, body []byte) string {
+	sigs := make([]string, len(secrets))
+	for i, secret := range secrets {
+		sigs[i] = Sign(secret, msgID, ts, body)
+	}
+
+	return strings.Join(sigs, " ")
+}
+
 // Verify checks a signature header the way a consumer would. tsHeader is
 // signed as received, not reformatted, so it must match the sender byte for
 // byte. Any one v1 signature matching is enough, which allows secret rotation.

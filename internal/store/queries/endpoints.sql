@@ -58,3 +58,13 @@ set disabled_at = null,
     first_failure_at = null,
     paused_until = null
 where id = $1;
+
+-- name: RotateEndpointSecret :execrows
+-- The replaced secret stays valid for 24 hours, Svix's default grace period.
+-- Rotating again inside that window drops the oldest secret, so a receiver
+-- still on it starts failing verification.
+update endpoints
+set previous_secret = secret,
+    previous_secret_expires_at = now() + interval '24 hours',
+    secret = sqlc.arg(secret)
+where id = sqlc.arg(id);

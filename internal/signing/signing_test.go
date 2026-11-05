@@ -225,3 +225,39 @@ func TestFormatTimestamp(t *testing.T) {
 		t.Errorf("FormatTimestamp(non-UTC) = %q, want %q", got, want)
 	}
 }
+
+// A receiver mid-rotation holds either the old or the new secret; the official
+// library must accept the header with either one, and reject any other.
+func TestSignAllVerifiesWithEitherSecret(t *testing.T) {
+	current, previous := signing.GenerateSecret(), signing.GenerateSecret()
+	ts := time.Unix(vectorTimestamp, 0)
+	body := []byte(`{"order":1}`)
+
+	sig := signing.SignAll([][]byte{current, previous}, vectorMsgID, ts, body)
+	if n := len(strings.Fields(sig)); n != 2 {
+		t.Fatalf("header has %d signatures, want 2: %q", n, sig)
+	}
+
+	h := http.Header{}
+	h.Set(standardwebhooks.HeaderWebhookID, vectorMsgID)
+	h.Set(standardwebhooks.HeaderWebhookTimestamp, strconv.FormatInt(ts.Unix(), 10))
+	h.Set(standardwebhooks.HeaderWebhookSignature, sig)
+
+	for name, secret := range map[string][]byte{"current": current, "previous": previous} {
+		lib, err := standardwebhooks.NewWebhookRaw(secret)
+		if err != nil {
+			t.Fatalf("NewWebhookRaw() error = %v", err)
+		}
+		if err := lib.VerifyIgnoringTimestamp(body, h); err != nil {
+			t.Errorf("library rejected the %s secret: %v", name, err)
+		}
+	}
+
+	lib, err := standardwebhooks.NewWebhookRaw(signing.GenerateSecret())
+	if err != nil {
+		t.Fatalf("NewWebhookRaw() error = %v", err)
+	}
+	if err := lib.VerifyIgnoringTimestamp(body, h); err == nil {
+		t.Error("library accepted an unrelated secret")
+	}
+}

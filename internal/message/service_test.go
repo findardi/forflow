@@ -4,11 +4,13 @@ package message_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,7 +115,7 @@ func TestCreateNotifiesWorkers(t *testing.T) {
 	}
 	conn := listen(t)
 
-	_, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`))
+	_, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`), "")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -140,7 +142,7 @@ func TestCreateSkipsDisabledEndpoints(t *testing.T) {
 		t.Fatalf("seed endpoints: %v", err)
 	}
 
-	msg, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`))
+	msg, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`), "")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -161,7 +163,7 @@ func TestCreateWithoutDeliveriesDoesNotNotify(t *testing.T) {
 	reset(t)
 	conn := listen(t)
 
-	_, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`))
+	_, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`), "")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -177,5 +179,118 @@ func TestCreateWithoutDeliveriesDoesNotNotify(t *testing.T) {
 	}
 	if ctx.Err() == nil {
 		t.Fatalf("wait: %v", err)
+	}
+}
+
+func seedEndpoint(t *testing.T) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		"INSERT INTO endpoints (url, secret) VALUES ($1, $2)",
+		"http://example.invalid/hook", []byte("forflow-test-signing-secret-32b!")); err != nil {
+		t.Fatalf("seed endpoint: %v", err)
+	}
+}
+
+func count(t *testing.T, table string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+// A producer retrying after a timeout must not fan out a second message: the
+// receiver could not tell the copies apart, since each gets its own webhook-id.
+func TestCreateWithSameKeyReturnsFirstMessage(t *testing.T) {
+	reset(t)
+	seedEndpoint(t)
+	svc := message.NewService(pool)
+
+	first, n1, err := svc.Create(context.Background(), []byte(`{"order":1}`), "order-1")
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	again, n2, err := svc.Create(context.Background(), []byte(`{"order":1}`), "order-1")
+	if err != nil {
+		t.Fatalf("repeat create: %v", err)
+	}
+
+	if again.ID != first.ID {
+		t.Errorf("repeat returned message %v, want the first %v", again.ID, first.ID)
+	}
+	if n1 != 1 || n2 != 1 {
+		t.Errorf("deliveries = %d then %d, want 1 both times", n1, n2)
+	}
+	if got := count(t, "messages"); got != 1 {
+		t.Errorf("messages = %d, want 1", got)
+	}
+	if got := count(t, "deliveries"); got != 1 {
+		t.Errorf("deliveries rows = %d, want 1", got)
+	}
+}
+
+func TestCreateWithoutKeyIsNotDeduplicated(t *testing.T) {
+	reset(t)
+	svc := message.NewService(pool)
+	for range 2 {
+		if _, _, err := svc.Create(context.Background(), []byte(`{"order":1}`), ""); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	if got := count(t, "messages"); got != 2 {
+		t.Errorf("messages = %d, want 2", got)
+	}
+}
+
+// Same key, different body is a client bug; answering with the first message
+// would silently drop the second payload.
+func TestCreateRejectsKeyReusedWithDifferentPayload(t *testing.T) {
+	reset(t)
+	svc := message.NewService(pool)
+	if _, _, err := svc.Create(context.Background(), []byte(`{"order":1}`), "order-1"); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	_, _, err := svc.Create(context.Background(), []byte(`{"order":2}`), "order-1")
+	if !errors.Is(err, message.ErrKeyReused) {
+		t.Fatalf("err = %v, want ErrKeyReused", err)
+	}
+	if got := count(t, "messages"); got != 1 {
+		t.Errorf("messages = %d, want 1", got)
+	}
+}
+
+// Retries can overlap the original request. The unique index makes the losers
+// wait for the winner's commit, so every caller sees one message.
+func TestConcurrentCreatesWithSameKey(t *testing.T) {
+	reset(t)
+	seedEndpoint(t)
+	svc := message.NewService(pool)
+
+	const callers = 10
+	ids := make([]string, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Go(func() {
+			msg, _, err := svc.Create(context.Background(), []byte(`{"order":1}`), "order-1")
+			ids[i], errs[i] = msg.ID.String(), err
+		})
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+		if ids[i] != ids[0] {
+			t.Errorf("caller %d got message %s, want %s", i, ids[i], ids[0])
+		}
+	}
+	if got := count(t, "messages"); got != 1 {
+		t.Errorf("messages = %d, want 1", got)
+	}
+	if got := count(t, "deliveries"); got != 1 {
+		t.Errorf("deliveries rows = %d, want 1", got)
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,8 +97,10 @@ func migrateUp(ctx context.Context) error {
 }
 
 // The breaker is set far out of reach so tests that predate it keep testing
-// retries alone; breaker_test.go narrows it.
+// retries alone; breaker_test.go narrows it. Transport skips netguard, which
+// would refuse every httptest server on loopback.
 var testConfig = delivery.Config{
+	Transport:          http.DefaultTransport,
 	HTTPTimeout:        500 * time.Millisecond,
 	Lease:              5 * time.Second,
 	PollInterval:       50 * time.Millisecond,
@@ -919,6 +922,45 @@ func TestEachAttemptIsLogged(t *testing.T) {
 	}
 	if !got[0].CreatedAt.Before(got[1].CreatedAt) {
 		t.Errorf("created_at %v then %v, want increasing", got[0].CreatedAt, got[1].CreatedAt)
+	}
+}
+
+// Without a Transport the worker uses netguard: a loopback endpoint is never
+// contacted, and the refusal is an endpoint failure, so retries and the
+// breaker apply as for any unreachable endpoint.
+func TestBlockedEndpointIsNeverContacted(t *testing.T) {
+	reset(t)
+	var hit atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit.Store(true) }))
+	defer srv.Close()
+
+	id := seed(t, srv.URL, []byte(`{}`))
+	cfg := testConfig
+	cfg.Transport = nil
+	startWorker(t, cfg)
+	r := waitAttempts(t, id, 1)
+
+	if r.Status != "pending" {
+		t.Errorf("status = %q, want pending (retry scheduled)", r.Status)
+	}
+	got := attemptsOf(t, id)
+	if len(got) != 1 {
+		t.Fatalf("got %d attempts %v, want 1", len(got), got)
+	}
+	if want := "#1 succeeded=false response_status=NULL error_kind=blocked"; got[0].String() != want {
+		t.Errorf("attempt = %s, want %s", got[0], want)
+	}
+	var failures int32
+	if err := pool.QueryRow(context.Background(), `
+		SELECT e.consecutive_failures FROM endpoints e
+		JOIN deliveries d ON d.endpoint_id = e.id WHERE d.id = $1`, id).Scan(&failures); err != nil {
+		t.Fatalf("query endpoint health: %v", err)
+	}
+	if failures != 1 {
+		t.Errorf("consecutive_failures = %d, want 1", failures)
+	}
+	if hit.Load() {
+		t.Error("loopback endpoint received the request")
 	}
 }
 

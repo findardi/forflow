@@ -16,7 +16,7 @@ insert into endpoints
     (url, secret)
 values
     ($1, $2)
-returning id, url, created_at, secret, consecutive_failures, first_failure_at, paused_until, disabled_at
+returning id, url, created_at, secret, consecutive_failures, first_failure_at, paused_until, disabled_at, previous_secret, previous_secret_expires_at
 `
 
 type CreateEndpointParams struct {
@@ -36,6 +36,8 @@ func (q *Queries) CreateEndpoint(ctx context.Context, arg CreateEndpointParams) 
 		&i.FirstFailureAt,
 		&i.PausedUntil,
 		&i.DisabledAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
 	)
 	return i, err
 }
@@ -61,7 +63,7 @@ func (q *Queries) EnableEndpoint(ctx context.Context, id pgtype.UUID) (int64, er
 }
 
 const getEndpointByID = `-- name: GetEndpointByID :one
-select id, url, created_at, secret, consecutive_failures, first_failure_at, paused_until, disabled_at from endpoints where id = $1
+select id, url, created_at, secret, consecutive_failures, first_failure_at, paused_until, disabled_at, previous_secret, previous_secret_expires_at from endpoints where id = $1
 `
 
 func (q *Queries) GetEndpointByID(ctx context.Context, id pgtype.UUID) (Endpoint, error) {
@@ -76,6 +78,8 @@ func (q *Queries) GetEndpointByID(ctx context.Context, id pgtype.UUID) (Endpoint
 		&i.FirstFailureAt,
 		&i.PausedUntil,
 		&i.DisabledAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
 	)
 	return i, err
 }
@@ -146,4 +150,28 @@ where id = $1 and consecutive_failures > 0
 func (q *Queries) RecordEndpointSuccess(ctx context.Context, id pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, recordEndpointSuccess, id)
 	return err
+}
+
+const rotateEndpointSecret = `-- name: RotateEndpointSecret :execrows
+update endpoints
+set previous_secret = secret,
+    previous_secret_expires_at = now() + interval '24 hours',
+    secret = $1
+where id = $2
+`
+
+type RotateEndpointSecretParams struct {
+	Secret []byte
+	ID     pgtype.UUID
+}
+
+// The replaced secret stays valid for 24 hours, Svix's default grace period.
+// Rotating again inside that window drops the oldest secret, so a receiver
+// still on it starts failing verification.
+func (q *Queries) RotateEndpointSecret(ctx context.Context, arg RotateEndpointSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rotateEndpointSecret, arg.Secret, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
