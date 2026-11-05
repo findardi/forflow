@@ -84,6 +84,49 @@ func (q *Queries) GetEndpointByID(ctx context.Context, id pgtype.UUID) (Endpoint
 	return i, err
 }
 
+const listEndpoints = `-- name: ListEndpoints :many
+select id, url, created_at, consecutive_failures, disabled_at
+from endpoints
+order by id desc
+limit 100
+`
+
+type ListEndpointsRow struct {
+	ID                  pgtype.UUID
+	Url                 string
+	CreatedAt           pgtype.Timestamptz
+	ConsecutiveFailures int32
+	DisabledAt          pgtype.Timestamptz
+}
+
+// Never selects the secrets: list output goes to the API and the dashboard.
+// ponytail: newest 100 only; add keyset pagination on id when lists grow.
+func (q *Queries) ListEndpoints(ctx context.Context) ([]ListEndpointsRow, error) {
+	rows, err := q.db.Query(ctx, listEndpoints)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEndpointsRow
+	for rows.Next() {
+		var i ListEndpointsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Url,
+			&i.CreatedAt,
+			&i.ConsecutiveFailures,
+			&i.DisabledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordEndpointFailure = `-- name: RecordEndpointFailure :one
 update endpoints
 set consecutive_failures = consecutive_failures + 1,

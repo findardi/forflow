@@ -7,10 +7,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"forflow/internal/endpoint"
 	"forflow/internal/message"
 	"forflow/internal/signing"
 	"forflow/internal/store/sqlc"
@@ -37,6 +37,7 @@ func NewRouter(q *sqlc.Queries, msg *message.Service, log *slog.Logger) http.Han
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /endpoints", a.listEndpoints)
 	mux.HandleFunc("POST /endpoints", a.createEndpoint)
 	mux.HandleFunc("POST /endpoints/{id}/enable", a.enableEndpoint)
 	mux.HandleFunc("POST /endpoints/{id}/secret/rotate", a.rotateSecret)
@@ -55,7 +56,7 @@ func (a *api) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !validURL(req.URL) {
+	if !endpoint.ValidURL(req.URL) {
 		http.Error(w, "url must be an absolute http or https URL", http.StatusBadRequest)
 		return
 	}
@@ -77,6 +78,36 @@ func (a *api) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		"secret":     signing.EncodeSecret(ep.Secret),
 		"created_at": ep.CreatedAt,
 	})
+}
+
+type endpointOut struct {
+	ID                  pgtype.UUID        `json:"id"`
+	URL                 string             `json:"url"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	ConsecutiveFailures int32              `json:"consecutive_failures"`
+	DisabledAt          pgtype.Timestamptz `json:"disabled_at"`
+}
+
+// listEndpoints returns the newest endpoints with their health, never secrets.
+func (a *api) listEndpoints(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.queries.ListEndpoints(r.Context())
+	if err != nil {
+		a.log.ErrorContext(r.Context(), "list endpoints", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]endpointOut, len(rows))
+	for i, e := range rows {
+		out[i] = endpointOut{
+			ID:                  e.ID,
+			URL:                 e.Url,
+			CreatedAt:           e.CreatedAt,
+			ConsecutiveFailures: e.ConsecutiveFailures,
+			DisabledAt:          e.DisabledAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": out})
 }
 
 // enableEndpoint turns a disabled endpoint back on and clears its breaker.
@@ -167,13 +198,6 @@ func (a *api) createMessage(w http.ResponseWriter, r *http.Request) {
 		"id":         msg.ID,
 		"deliveries": n,
 	})
-}
-
-// validURL rejects anything a worker could not POST to. It does not block
-// private addresses; that is netguard's job at dial time.
-func validURL(raw string) bool {
-	u, err := url.Parse(raw)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

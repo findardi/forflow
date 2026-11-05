@@ -1,0 +1,24 @@
+{{define "endpoints" -}}
+<section id="endpoints">
+{{with .Error}}<p class="error" role="alert">{{.}}</p>{{end}}
+{{with .Secret}}<p class="notice" role="status">{{$.Notice}} <code>{{.}}</code><br>Copy it now; it is not shown again.</p>{{end}}
+<table>
+<thead><tr><th>URL</th><th>Status</th><th>Created</th><th></th></tr></thead>
+<tbody>
+{{range .Endpoints}}
+<tr>
+  <td>{{.Url}}</td>
+  <td>{{if .DisabledAt.Valid}}<span class="disabled">disabled</span>
+      {{else if .ConsecutiveFailures}}<span class="failing">failing ({{.ConsecutiveFailures}})</span>
+      {{else}}healthy{{end}}</td>
+  <td>{{.CreatedAt.Time.UTC.Format "2006-01-02 15:04"}} UTC</td>
+  <td><button hx-post="/dashboard/endpoints/{{.ID}}/rotate" hx-target="#endpoints" hx-swap="outerHTML"
+              hx-confirm="Rotate the secret for {{.Url}}? The old one keeps signing for 24 hours.">Rotate secret</button></td>
+</tr>
+{{else}}
+<tr><td colspan="4">No endpoints yet.</td></tr>
+{{end}}
+</tbody>
+</table>
+</section>
+{{- end}}

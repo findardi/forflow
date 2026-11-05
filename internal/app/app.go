@@ -11,11 +11,13 @@ import (
 	"time"
 
 	"forflow/internal/config"
+	"forflow/internal/dashboard"
 	"forflow/internal/delivery"
 	"forflow/internal/httpapi"
 	"forflow/internal/message"
 	"forflow/internal/scheduler"
 	"forflow/internal/store/sqlc"
+	"forflow/web"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -32,7 +34,7 @@ func RunAPI(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(sqlc.New(pool), message.NewService(pool), log),
+		Handler:           routes(sqlc.New(pool), message.NewService(pool), log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -61,6 +63,17 @@ func RunAPI(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return fmt.Errorf("serve http: %w", err)
 	}
 	return nil
+}
+
+// routes puts the dashboard and its static files beside the public API.
+// ponytail: no auth on any route yet; the dashboard is for development until
+// tenants and API keys exist.
+func routes(q *sqlc.Queries, msg *message.Service, log *slog.Logger) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/", httpapi.NewRouter(q, msg, log))
+	mux.Handle("/dashboard/", dashboard.New(q, log))
+	mux.Handle("GET /static/", http.FileServerFS(web.Static))
+	return mux
 }
 
 // RunWorker runs the delivery worker until ctx is cancelled.
