@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
+	"forflow/internal/netguard"
 	"forflow/internal/signing"
 	"forflow/internal/store/sqlc"
 )
@@ -73,6 +74,8 @@ type Config struct {
 	// DisableAfter is how long an endpoint may fail without a single success
 	// before it is disabled and needs a human to enable it again.
 	DisableAfter time.Duration
+	// Transport nil means netguard; only tests set it (httptest is loopback).
+	Transport http.RoundTripper
 }
 
 // New returns a Worker that uses pool for claims and outcomes.
@@ -81,6 +84,11 @@ func New(pool *pgxpool.Pool, cfg Config) *Worker {
 	if log == nil {
 		log = slog.Default()
 	}
+
+	if cfg.Transport == nil {
+		cfg.Transport = netguard.NewTransport()
+	}
+
 	return &Worker{
 		pool: pool,
 		q:    sqlc.New(pool),
@@ -93,6 +101,7 @@ func New(pool *pgxpool.Pool, cfg Config) *Worker {
 			Timeout: cfg.HTTPTimeout,
 			// A 3xx is a failed attempt
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Transport:     cfg.Transport,
 		},
 		log:    log,
 		wake:   make(chan struct{}, 1),
@@ -258,12 +267,14 @@ func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult
 	return result
 }
 
-// errorKind maps a transport error to a fixed label. DNS is checked first
-// because *net.DNSError also reports Timeout().
+// errorKind maps a transport error to a fixed label. Order matters: blocked
+// errors are net.Errors too, and *net.DNSError also reports Timeout().
 func errorKind(err error) string {
 	var dnsErr *net.DNSError
 	var netErr net.Error
 	switch {
+	case errors.Is(err, netguard.ErrBlocked):
+		return "blocked"
 	case errors.As(err, &dnsErr):
 		return "dns"
 	case errors.As(err, &netErr) && netErr.Timeout():
