@@ -221,6 +221,7 @@ const (
 	outcomeSent           outcome = iota // endpoint replied 2xx
 	outcomeEndpointFailed                // endpoint was contacted but did not accept
 	outcomeDiscarded                     // we failed before contacting the endpoint
+	outcomeAborted                       // endpoint failed and asked us to stop retrying
 )
 
 type sendResult struct {
@@ -245,7 +246,12 @@ func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("webhook-id", msgID)
 	req.Header.Set("webhook-timestamp", signing.FormatTimestamp(ts))
-	req.Header.Set("webhook-signature", signing.Sign(job.Secret, msgID, ts, job.Payload))
+	// During a rotation the old secret signs too, until it expires.
+	secrets := [][]byte{job.Secret}
+	if job.PreviousSecret != nil {
+		secrets = append(secrets, job.PreviousSecret)
+	}
+	req.Header.Set("webhook-signature", signing.SignAll(secrets, msgID, ts, job.Payload))
 
 	start := w.now()
 	resp, err := w.httpClient.Do(req)
@@ -261,8 +267,11 @@ func (w *Worker) send(ctx context.Context, job sqlc.ClaimDeliveryRow) sendResult
 
 	code := int32(resp.StatusCode)
 	result := sendResult{outcome: outcomeEndpointFailed, responseStatus: &code, duration: duration, startedAt: start}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		result.outcome = outcomeSent
+	case resp.Header.Get("webhook-delivery") == "abort-message":
+		result.outcome = outcomeAborted
 	}
 	return result
 }
@@ -333,6 +342,9 @@ func (w *Worker) record(ctx context.Context, job sqlc.ClaimDeliveryRow, res send
 	case outcomeSent:
 		status = "sent"
 		rows, err = q.MarkSent(ctx, sqlc.MarkSentParams{ID: job.ID, LeaseID: job.LeaseID, ResponseStatus: code})
+	case outcomeAborted:
+		status = "aborted"
+		rows, err = q.MarkFailed(ctx, sqlc.MarkFailedParams{ID: job.ID, LeaseID: job.LeaseID, ResponseStatus: code})
 	case outcomeDiscarded:
 		status = "discarded"
 		rows, err = q.MarkDiscarded(ctx, sqlc.MarkDiscardedParams{ID: job.ID, LeaseID: job.LeaseID})
@@ -408,7 +420,8 @@ func (w *Worker) record(ctx context.Context, job sqlc.ClaimDeliveryRow, res send
 // recordHealth feeds the attempt into the endpoint's breaker and auto-disable
 // state. It runs in the record transaction, after the lease-fenced update, so
 // an outcome that is rolled back or dropped never counts against the endpoint.
-// A discarded delivery never reached the endpoint and says nothing about it.
+// A discarded delivery never reached the endpoint and says nothing about it;
+// an aborted one is a deliberate reply, not a sign the endpoint is broken.
 func (w *Worker) recordHealth(ctx context.Context, q *sqlc.Queries, job sqlc.ClaimDeliveryRow, o outcome) (disabled bool, err error) {
 	switch o {
 	case outcomeSent:

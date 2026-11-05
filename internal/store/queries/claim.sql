@@ -66,4 +66,6 @@ where d.id = (
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
-returning d.id, d.endpoint_id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret;
+-- An expired previous secret is left in the row; it just stops signing.
+returning d.id, d.endpoint_id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret,
+    (case when e.previous_secret_expires_at > now() then e.previous_secret end)::bytea as previous_secret;

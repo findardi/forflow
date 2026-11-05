@@ -39,7 +39,8 @@ where d.id = (
 )
 and m.id = d.message_id
 and e.id = d.endpoint_id
-returning d.id, d.endpoint_id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret
+returning d.id, d.endpoint_id, e.url as endpoint, m.payload, d.lease_id, d.attempt_count, d.message_id, e.secret,
+    (case when e.previous_secret_expires_at > now() then e.previous_secret end)::bytea as previous_secret
 `
 
 type ClaimDeliveryParams struct {
@@ -50,18 +51,20 @@ type ClaimDeliveryParams struct {
 }
 
 type ClaimDeliveryRow struct {
-	ID           pgtype.UUID
-	EndpointID   pgtype.UUID
-	Endpoint     string
-	Payload      []byte
-	LeaseID      pgtype.UUID
-	AttemptCount int32
-	MessageID    pgtype.UUID
-	Secret       []byte
+	ID             pgtype.UUID
+	EndpointID     pgtype.UUID
+	Endpoint       string
+	Payload        []byte
+	LeaseID        pgtype.UUID
+	AttemptCount   int32
+	MessageID      pgtype.UUID
+	Secret         []byte
+	PreviousSecret []byte
 }
 
 // Must run in the transaction that holds the endpoint lock from
 // LockClaimableEndpoint. Returns no row when the endpoint is already at its cap.
+// An expired previous secret is left in the row; it just stops signing.
 func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (ClaimDeliveryRow, error) {
 	row := q.db.QueryRow(ctx, claimDelivery,
 		arg.Lease,
@@ -79,6 +82,7 @@ func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (C
 		&i.AttemptCount,
 		&i.MessageID,
 		&i.Secret,
+		&i.PreviousSecret,
 	)
 	return i, err
 }

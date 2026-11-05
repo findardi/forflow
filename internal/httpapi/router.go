@@ -39,6 +39,7 @@ func NewRouter(q *sqlc.Queries, msg *message.Service, log *slog.Logger) http.Han
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /endpoints", a.createEndpoint)
 	mux.HandleFunc("POST /endpoints/{id}/enable", a.enableEndpoint)
+	mux.HandleFunc("POST /endpoints/{id}/secret/rotate", a.rotateSecret)
 	mux.HandleFunc("POST /messages", a.createMessage)
 	return mux
 }
@@ -100,6 +101,32 @@ func (a *api) enableEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	a.log.InfoContext(r.Context(), "endpoint enabled", "endpoint_id", id.String())
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// rotateSecret replaces the endpoint's secret. The old one keeps signing for
+// 24 hours, so the customer can switch without failed verifications. The new
+// secret is shown only here, as at creation.
+func (a *api) rotateSecret(w http.ResponseWriter, r *http.Request) {
+	var id pgtype.UUID
+	if err := id.Scan(r.PathValue("id")); err != nil {
+		http.Error(w, "invalid endpoint id", http.StatusBadRequest)
+		return
+	}
+
+	secret := signing.GenerateSecret()
+	n, err := a.queries.RotateEndpointSecret(r.Context(), sqlc.RotateEndpointSecretParams{ID: id, Secret: secret})
+	if err != nil {
+		a.log.ErrorContext(r.Context(), "rotate endpoint secret", "endpoint_id", id.String(), "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if n == 0 {
+		http.Error(w, "endpoint not found", http.StatusNotFound)
+		return
+	}
+
+	a.log.InfoContext(r.Context(), "endpoint secret rotated", "endpoint_id", id.String())
+	writeJSON(w, http.StatusOK, map[string]any{"secret": signing.EncodeSecret(secret)})
 }
 
 // createMessage treats the whole request body as the payload, so the bytes
