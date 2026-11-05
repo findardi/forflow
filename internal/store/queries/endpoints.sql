@@ -8,6 +8,14 @@ returning *;
 -- name: GetEndpointByID :one
 select * from endpoints where id = $1;
 
+-- name: ListEndpoints :many
+-- Never selects the secrets: list output goes to the API and the dashboard.
+-- ponytail: newest 100 only; add keyset pagination on id when lists grow.
+select id, url, created_at, consecutive_failures, disabled_at
+from endpoints
+order by id desc
+limit 100;
+
 -- Health queries run in the record transaction, after the lease-fenced outcome
 -- update succeeded, so an attempt that lost its lease never touches the endpoint.
 

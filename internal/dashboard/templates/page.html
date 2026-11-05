@@ -1,0 +1,32 @@
+{{define "page" -}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>forflow</title>
+<script src="/static/htmx.min.js"></script>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  form.add { display: flex; gap: .5rem; margin: 1rem 0; }
+  form.add input { flex: 1; padding: .4rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .4rem; border-bottom: 1px solid #ddd; }
+  .notice { background: #eef7ee; padding: .6rem; border: 1px solid #b7dcb7; }
+  .error { background: #fbeaea; padding: .6rem; border: 1px solid #e3b4b4; }
+  code { word-break: break-all; }
+  .disabled { color: #b00020; }
+  .failing { color: #a35c00; }
+</style>
+</head>
+<body>
+<h1>forflow</h1>
+<form class="add" hx-post="/dashboard/endpoints" hx-target="#endpoints" hx-swap="outerHTML"
+      hx-on::after-request="if (event.detail.successful) this.reset()">
+  <input name="url" type="url" required placeholder="https://example.com/webhooks" aria-label="Endpoint URL">
+  <button>Add endpoint</button>
+</form>
+{{template "endpoints" .}}
+</body>
+</html>
+{{- end}}
