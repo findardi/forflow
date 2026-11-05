@@ -3,6 +3,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,8 +17,9 @@ import (
 )
 
 const (
-	maxEndpointBody = 4 << 10
-	maxMessageBody  = 1 << 20
+	maxEndpointBody   = 4 << 10
+	maxMessageBody    = 1 << 20
+	maxIdempotencyKey = 255
 )
 
 type api struct {
@@ -101,7 +103,8 @@ func (a *api) enableEndpoint(w http.ResponseWriter, r *http.Request) {
 }
 
 // createMessage treats the whole request body as the payload, so the bytes
-// delivered later are exactly the bytes the producer sent.
+// delivered later are exactly the bytes the producer sent. A repeat with the
+// same Idempotency-Key gets the first message's response.
 func (a *api) createMessage(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxMessageBody)
 	payload, err := io.ReadAll(r.Body)
@@ -115,7 +118,17 @@ func (a *api) createMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, n, err := a.messages.Create(r.Context(), payload)
+	key := r.Header.Get("Idempotency-Key")
+	if len(key) > maxIdempotencyKey {
+		http.Error(w, "Idempotency-Key must be at most 255 bytes", http.StatusBadRequest)
+		return
+	}
+
+	msg, n, err := a.messages.Create(r.Context(), payload, key)
+	if errors.Is(err, message.ErrKeyReused) {
+		http.Error(w, "Idempotency-Key was already used with a different body", http.StatusConflict)
+		return
+	}
 	if err != nil {
 		a.log.ErrorContext(r.Context(), "create message", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)

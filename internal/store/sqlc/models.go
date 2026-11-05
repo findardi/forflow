@@ -44,7 +44,8 @@ type Endpoint struct {
 }
 
 type Message struct {
-	ID        pgtype.UUID
-	Payload   []byte
-	CreatedAt pgtype.Timestamptz
+	ID             pgtype.UUID
+	Payload        []byte
+	CreatedAt      pgtype.Timestamptz
+	IdempotencyKey pgtype.Text
 }

@@ -13,26 +13,60 @@ import (
 
 const createMessage = `-- name: CreateMessage :one
 insert into messages
-    (payload)
+    (payload, idempotency_key)
 values
-    ($1)
-returning id, payload, created_at
+    ($1, $2)
+on conflict (idempotency_key) do nothing
+returning id, payload, created_at, idempotency_key
 `
 
-func (q *Queries) CreateMessage(ctx context.Context, payload []byte) (Message, error) {
-	row := q.db.QueryRow(ctx, createMessage, payload)
+type CreateMessageParams struct {
+	Payload        []byte
+	IdempotencyKey pgtype.Text
+}
+
+// No row means the key is taken. A concurrent insert with the same key waits
+// for the first transaction, then returns nothing once it commits.
+func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (Message, error) {
+	row := q.db.QueryRow(ctx, createMessage, arg.Payload, arg.IdempotencyKey)
 	var i Message
-	err := row.Scan(&i.ID, &i.Payload, &i.CreatedAt)
+	err := row.Scan(
+		&i.ID,
+		&i.Payload,
+		&i.CreatedAt,
+		&i.IdempotencyKey,
+	)
 	return i, err
 }
 
 const getMessageByID = `-- name: GetMessageByID :one
-select id, payload, created_at from messages where id = $1
+select id, payload, created_at, idempotency_key from messages where id = $1
 `
 
 func (q *Queries) GetMessageByID(ctx context.Context, id pgtype.UUID) (Message, error) {
 	row := q.db.QueryRow(ctx, getMessageByID, id)
 	var i Message
-	err := row.Scan(&i.ID, &i.Payload, &i.CreatedAt)
+	err := row.Scan(
+		&i.ID,
+		&i.Payload,
+		&i.CreatedAt,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
+const getMessageByIdempotencyKey = `-- name: GetMessageByIdempotencyKey :one
+select id, payload, created_at, idempotency_key from messages where idempotency_key = $1
+`
+
+func (q *Queries) GetMessageByIdempotencyKey(ctx context.Context, idempotencyKey pgtype.Text) (Message, error) {
+	row := q.db.QueryRow(ctx, getMessageByIdempotencyKey, idempotencyKey)
+	var i Message
+	err := row.Scan(
+		&i.ID,
+		&i.Payload,
+		&i.CreatedAt,
+		&i.IdempotencyKey,
+	)
 	return i, err
 }

@@ -125,7 +125,7 @@ func TestIngestWakesWorker(t *testing.T) {
 	// The listener's connect wake is spent on an empty claim before ingest.
 	settle()
 
-	msg, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`))
+	msg, n, err := message.NewService(pool).Create(context.Background(), []byte(`{"order":1}`), "")
 	if err != nil || n != 1 {
 		t.Fatalf("create: n=%d err=%v", n, err)
 	}
